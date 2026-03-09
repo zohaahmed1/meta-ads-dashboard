@@ -37,6 +37,7 @@ from meta_ads.meta_api import (
     get_accounts, set_active_account, get_active_account,
     get_comparison_dates, ATTRIBUTION_WINDOWS,
     get_creative_thumbnails, fetch_ad_previews,
+    get_last_api_error,
 )
 from meta_ads.metrics import (
     insights_to_dataframe, summary_metrics, daily_trend,
@@ -799,7 +800,12 @@ def main():
             df = df[df["campaign_id"].isin(active_ids)]
 
     if df.empty:
-        st.warning("No data returned for the selected filters.")
+        # Check for API error first
+        api_error = get_last_api_error()
+        if api_error:
+            st.error(f"Meta API Error: {api_error}")
+        else:
+            st.warning("No data returned for the selected filters.")
 
         # ── Diagnostics: help the user figure out why ──
         with st.expander("Troubleshooting Info", expanded=True):
@@ -807,6 +813,13 @@ def main():
             date_label = date_preset or f"{config['custom_since']} → {config['custom_until']}"
             st.markdown(f"**Date range:** {date_label}")
             st.markdown(f"**Status filter:** {config['statuses'] if config['statuses'] else 'None (all)'}")
+
+            if api_error:
+                st.markdown(f"**API Error:** `{api_error}`")
+                if "expired" in api_error.lower() or "token" in api_error.lower() or "190" in str(api_error):
+                    st.error("Your Meta access token may have expired. Generate a new one at https://developers.facebook.com/tools/explorer/ and update Streamlit secrets.")
+                elif "100" in str(api_error) or "permission" in api_error.lower():
+                    st.error("Permission issue — the token may not have access to this ad account.")
 
             # Check what campaigns actually exist
             if campaigns_data:
@@ -820,17 +833,9 @@ def main():
             else:
                 st.markdown("**Campaigns in account:** 0 (or API error)")
 
-            # Check if raw insights came back before filtering
-            raw_df = load_insights(
-                account_id, date_preset, level,
-                since=config["custom_since"], until=config["custom_until"],
-                attribution_windows=config["attr_windows"],
-            )
-            st.markdown(f"**Raw insight rows (before status filter):** {len(raw_df)}")
+            st.markdown(f"**Raw insight rows (before status filter):** {len(df)}")
 
-            if len(raw_df) > 0 and config["statuses"]:
-                st.info("Data exists but was filtered out by the Campaign Status filter. Clear the status filter to see all data.")
-            elif len(raw_df) == 0:
+            if not api_error and len(df) == 0:
                 st.info("The Meta API returned no data for this account and date range. The account may not have had any ad spend in this period.")
         return
 

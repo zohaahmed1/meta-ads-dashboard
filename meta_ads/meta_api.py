@@ -177,6 +177,21 @@ def _handle_rate_limit(response):
         pass
 
 
+# Store the last API error so the dashboard can surface it
+_last_api_error = None
+
+
+def get_last_api_error():
+    """Return the last API error message (or None)."""
+    return _last_api_error
+
+
+def clear_last_api_error():
+    """Clear the stored API error."""
+    global _last_api_error
+    _last_api_error = None
+
+
 def meta_api_get(endpoint, params=None):
     """Make authenticated GET request to the Meta Graph API.
 
@@ -186,7 +201,10 @@ def meta_api_get(endpoint, params=None):
 
     Returns: dict (JSON response) or None on error
     """
+    global _last_api_error
+
     if not _check_credentials():
+        _last_api_error = "Missing credentials: META_ACCESS_TOKEN or META_AD_ACCOUNT_IDS not set."
         return None
 
     if params is None:
@@ -198,6 +216,7 @@ def meta_api_get(endpoint, params=None):
         resp = requests.get(url, params=params, timeout=60)
         _handle_rate_limit(resp)
         resp.raise_for_status()
+        _last_api_error = None
         return resp.json()
     except requests.exceptions.HTTPError as e:
         error_data = {}
@@ -207,10 +226,12 @@ def meta_api_get(endpoint, params=None):
             pass
         error_msg = error_data.get("error", {}).get("message", str(e))
         error_code = error_data.get("error", {}).get("code", "")
-        print(f"[ERR] Meta API {resp.status_code}: {error_msg} (code={error_code})")
+        _last_api_error = f"Meta API {resp.status_code}: {error_msg} (code={error_code})"
+        print(f"[ERR] {_last_api_error}")
         return None
     except requests.exceptions.RequestException as e:
-        print(f"[ERR] Meta API request failed: {e}")
+        _last_api_error = f"Meta API request failed: {e}"
+        print(f"[ERR] {_last_api_error}")
         return None
 
 
