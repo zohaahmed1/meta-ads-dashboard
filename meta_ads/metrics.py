@@ -293,6 +293,87 @@ def audience_breakdown(df, breakdown_col):
     return grouped
 
 
+def period_comparison(current_summary, previous_summary):
+    """Calculate % change between current and previous period for each KPI.
+
+    Returns: dict of {metric: {current, previous, change_pct, improved}}
+    """
+    # Metrics where lower is better
+    lower_is_better = {"cost_per_conversion", "avg_cpc", "avg_cpm"}
+    comparison = {}
+    for key in current_summary:
+        cur = current_summary[key]
+        prev = previous_summary[key]
+        if prev and prev != 0:
+            pct = ((cur - prev) / abs(prev)) * 100
+        else:
+            pct = 0.0 if cur == 0 else 100.0
+        improved = pct < 0 if key in lower_is_better else pct > 0
+        comparison[key] = {
+            "current": cur,
+            "previous": prev,
+            "change_pct": pct,
+            "improved": improved,
+        }
+    return comparison
+
+
+def funnel_metrics(df):
+    """Build funnel data: impressions -> clicks -> landing page views -> conversions.
+
+    Returns: list of (stage_name, value) tuples
+    """
+    if df.empty:
+        return []
+    stages = [
+        ("Impressions", df["impressions"].sum()),
+        ("Clicks", df["clicks"].sum()),
+        ("Link Clicks", df["link_clicks"].sum()),
+        ("Landing Page Views", df["landing_page_views"].sum()),
+        ("Conversions", df["total_conversions"].sum()),
+    ]
+    # Filter out zero stages (except impressions)
+    return [(name, val) for name, val in stages if val > 0 or name == "Impressions"]
+
+
+def budget_pacing(campaigns, insights_df):
+    """Calculate budget pacing: budget vs actual spend per campaign.
+
+    Args:
+        campaigns: list of campaign dicts from fetch_campaigns()
+        insights_df: DataFrame from insights_to_dataframe()
+
+    Returns: DataFrame with budget, spend, and pacing % per campaign
+    """
+    if not campaigns or insights_df.empty:
+        return pd.DataFrame()
+
+    spend_by_campaign = insights_df.groupby("campaign_id")["spend"].sum().to_dict()
+
+    rows = []
+    for camp in campaigns:
+        cid = camp.get("id", "")
+        # Meta returns budgets in cents
+        daily_b = float(camp.get("daily_budget", 0) or 0) / 100
+        lifetime_b = float(camp.get("lifetime_budget", 0) or 0) / 100
+        actual = spend_by_campaign.get(cid, 0)
+        budget = daily_b or lifetime_b
+        pacing = (actual / budget * 100) if budget > 0 else 0
+
+        rows.append({
+            "campaign_name": camp.get("name", ""),
+            "campaign_id": cid,
+            "status": camp.get("status", ""),
+            "daily_budget": daily_b,
+            "lifetime_budget": lifetime_b,
+            "budget": budget,
+            "actual_spend": actual,
+            "pacing_pct": pacing,
+        })
+
+    return pd.DataFrame(rows).sort_values("actual_spend", ascending=False)
+
+
 def top_performers(df, metric="roas", n=10, ascending=False):
     """Return top N rows by a given metric.
 

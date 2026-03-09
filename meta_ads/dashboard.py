@@ -1,6 +1,18 @@
 """
 Meta Ads Dashboard — Interactive Streamlit app for analyzing Meta ad performance.
 
+Features:
+  - Period-over-period comparison with % change arrows
+  - Custom date range picker
+  - Campaign status filter (Active/Paused/Archived)
+  - Budget pacing (budget vs actual spend)
+  - Funnel visualization (impressions → clicks → conversions)
+  - Frequency alerts (flags high ad frequency)
+  - Attribution window toggle (1d click, 7d click, etc.)
+  - Auto-refresh on configurable interval
+  - Send report summary to Slack via webhook
+  - Ad creative thumbnails alongside performance data
+
 Launch: streamlit run meta_ads/dashboard.py
    or: python3 meta_ads_tool.py
 """
@@ -11,20 +23,32 @@ import plotly.express as px
 import plotly.graph_objects as go
 import sys
 import os
+import time
+import requests as req_lib
+from datetime import datetime, timedelta, date
 
 # Ensure meta_ads package is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from meta_ads.meta_api import (
-    fetch_insights, fetch_campaigns, VALID_DATE_PRESETS,
+    fetch_insights, fetch_campaigns, fetch_ads, VALID_DATE_PRESETS,
     VALID_LEVELS, VALID_BREAKDOWNS, _check_credentials,
     get_accounts, set_active_account, get_active_account,
+    get_comparison_dates, ATTRIBUTION_WINDOWS,
 )
 from meta_ads.metrics import (
     insights_to_dataframe, summary_metrics, daily_trend,
     campaign_comparison, creative_performance, audience_breakdown,
     format_currency, format_number, format_pct, format_roas,
+    period_comparison, funnel_metrics, budget_pacing,
 )
+
+# Try optional auto-refresh package
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except ImportError:
+    HAS_AUTOREFRESH = False
 
 
 # ── Page config ──
@@ -38,17 +62,21 @@ st.set_page_config(
 
 # ── Cached data fetchers ──
 @st.cache_data(ttl=300, show_spinner=False)
-def load_insights(date_preset, level, time_increment=None):
+def load_insights(date_preset, level, time_increment=None,
+                  since=None, until=None, attribution_windows=None):
     raw = fetch_insights(
-        date_preset=date_preset, level=level, time_increment=time_increment
+        date_preset=date_preset, level=level, time_increment=time_increment,
+        since=since, until=until, action_attribution_windows=attribution_windows,
     )
     return insights_to_dataframe(raw)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_insights_with_breakdown(date_preset, level, breakdown):
+def load_insights_with_breakdown(date_preset, level, breakdown,
+                                 since=None, until=None, attribution_windows=None):
     raw = fetch_insights(
-        date_preset=date_preset, level=level, breakdowns=[breakdown]
+        date_preset=date_preset, level=level, breakdowns=[breakdown],
+        since=since, until=until, action_attribution_windows=attribution_windows,
     )
     return insights_to_dataframe(raw)
 
@@ -56,6 +84,11 @@ def load_insights_with_breakdown(date_preset, level, breakdown):
 @st.cache_data(ttl=600, show_spinner=False)
 def load_campaigns():
     return fetch_campaigns()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_ads():
+    return fetch_ads()
 
 
 # ── Sidebar ──
@@ -78,51 +111,159 @@ def render_sidebar():
 
     st.sidebar.markdown("---")
 
-    date_range = st.sidebar.selectbox(
-        "Date Range",
-        VALID_DATE_PRESETS,
-        index=VALID_DATE_PRESETS.index("last_7d"),
-        format_func=lambda x: x.replace("_", " ").title(),
+    # ── Date range: preset or custom ──
+    date_mode = st.sidebar.radio(
+        "Date Range Mode", ["Preset", "Custom"],
+        horizontal=True, label_visibility="collapsed",
     )
 
+    date_preset = None
+    custom_since = None
+    custom_until = None
+
+    if date_mode == "Preset":
+        date_preset = st.sidebar.selectbox(
+            "Date Range",
+            VALID_DATE_PRESETS,
+            index=VALID_DATE_PRESETS.index("last_7d"),
+            format_func=lambda x: x.replace("_", " ").title(),
+        )
+    else:
+        today = date.today()
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            custom_start = st.date_input("From", today - timedelta(days=7))
+        with col2:
+            custom_end = st.date_input("To", today - timedelta(days=1))
+        custom_since = custom_start.isoformat()
+        custom_until = custom_end.isoformat()
+
+    # ── Campaign status filter ──
+    status_options = ["ACTIVE", "PAUSED", "ARCHIVED"]
+    selected_statuses = st.sidebar.multiselect(
+        "Campaign Status", status_options, default=["ACTIVE"],
+    )
+
+    # ── Reporting level ──
     level = st.sidebar.selectbox(
-        "Reporting Level",
-        VALID_LEVELS,
+        "Reporting Level", VALID_LEVELS,
         format_func=lambda x: x.title(),
     )
 
+    # ── Attribution window ──
+    attribution = st.sidebar.selectbox(
+        "Attribution Window",
+        ["Default (7d click + 1d view)", "1d_click", "7d_click", "28d_click", "1d_view"],
+    )
+    attr_windows = None
+    if attribution != "Default (7d click + 1d view)":
+        attr_windows = [attribution]
+
     st.sidebar.markdown("---")
+
+    # ── Auto-refresh ──
+    auto_refresh = st.sidebar.checkbox("Auto-refresh")
+    refresh_mins = 5
+    if auto_refresh:
+        refresh_mins = st.sidebar.slider("Interval (min)", 1, 30, 5)
+        if HAS_AUTOREFRESH:
+            st_autorefresh(interval=refresh_mins * 60 * 1000, key="auto_refresh")
+        else:
+            st.sidebar.caption("Install `streamlit-autorefresh` for true auto-refresh")
+
+    # ── Slack webhook (collapsible) ──
+    with st.sidebar.expander("Slack Integration"):
+        slack_webhook = st.text_input(
+            "Webhook URL", type="password",
+            placeholder="https://hooks.slack.com/services/...",
+            key="slack_webhook",
+        )
 
     if st.sidebar.button("Refresh Data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-    return date_range, level
+    return {
+        "date_preset": date_preset,
+        "custom_since": custom_since,
+        "custom_until": custom_until,
+        "level": level,
+        "statuses": selected_statuses,
+        "attr_windows": attr_windows,
+        "auto_refresh": auto_refresh,
+        "refresh_mins": refresh_mins,
+        "slack_webhook": slack_webhook,
+    }
 
 
-# ── KPI row ──
-def render_kpis(summary):
+# ── KPI row with period-over-period deltas ──
+def render_kpis(summary, comparison=None):
     cols = st.columns(6)
     kpis = [
-        ("Spend", format_currency(summary["total_spend"])),
-        ("Impressions", format_number(summary["total_impressions"])),
-        ("Clicks", format_number(summary["total_clicks"])),
-        ("CTR", format_pct(summary["avg_ctr"])),
-        ("Conversions", format_number(summary["total_conversions"])),
-        ("ROAS", format_roas(summary["roas"])),
+        ("Spend", "total_spend", format_currency),
+        ("Impressions", "total_impressions", format_number),
+        ("Clicks", "total_clicks", format_number),
+        ("CTR", "avg_ctr", format_pct),
+        ("Conversions", "total_conversions", format_number),
+        ("ROAS", "roas", format_roas),
     ]
-    for col, (label, value) in zip(cols, kpis):
-        col.metric(label, value)
+    for col, (label, key, fmt) in zip(cols, kpis):
+        value = fmt(summary[key])
+        if comparison and key in comparison:
+            delta_pct = comparison[key]["change_pct"]
+            delta_str = f"{delta_pct:+.1f}%"
+            # For spend, lower could be good or bad depending on context
+            # For CTR/ROAS/conversions higher is better
+            col.metric(label, value, delta=delta_str)
+        else:
+            col.metric(label, value)
+
+
+# ── Funnel tab ──
+def render_funnel(df):
+    funnel = funnel_metrics(df)
+    if not funnel:
+        st.info("No funnel data available.")
+        return
+
+    st.subheader("Conversion Funnel")
+
+    names = [f[0] for f in funnel]
+    values = [f[1] for f in funnel]
+
+    fig = go.Figure(go.Funnel(
+        y=names,
+        x=values,
+        textinfo="value+percent initial+percent previous",
+        marker=dict(color=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"][:len(funnel)]),
+        connector=dict(line=dict(color="gray", width=1)),
+    ))
+    fig.update_layout(height=400, margin=dict(t=20, b=20, l=20, r=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Conversion rates between stages
+    st.subheader("Stage-to-Stage Conversion Rates")
+    rate_cols = st.columns(len(funnel) - 1)
+    for i, col in enumerate(rate_cols):
+        if values[i] > 0:
+            rate = values[i + 1] / values[i] * 100
+            col.metric(
+                f"{names[i]} → {names[i+1]}",
+                f"{rate:.1f}%",
+            )
 
 
 # ── Overview tab ──
-def render_overview(df, date_range):
+def render_overview(df, config):
     if df.empty:
         st.info("No data for the selected date range.")
         return
 
-    # Daily trends
-    daily_df = load_insights(date_range, "campaign", time_increment=1)
+    daily_df = load_insights(
+        config["date_preset"], "campaign", time_increment=1,
+        since=config["custom_since"], until=config["custom_until"],
+        attribution_windows=config["attr_windows"],
+    )
     trend = daily_trend(daily_df)
 
     if not trend.empty:
@@ -167,7 +308,6 @@ def render_overview(df, date_range):
             )
             st.plotly_chart(fig, use_container_width=True)
 
-    # Campaign spend bar chart
     camp_df = campaign_comparison(df)
     if not camp_df.empty:
         st.subheader("Spend by Campaign")
@@ -176,15 +316,12 @@ def render_overview(df, date_range):
             color="spend", color_continuous_scale="Blues",
             labels={"campaign_name": "Campaign", "spend": "Spend ($)"},
         )
-        fig.update_layout(
-            showlegend=False, height=350,
-            margin=dict(t=20, b=40),
-        )
+        fig.update_layout(showlegend=False, height=350, margin=dict(t=20, b=40))
         st.plotly_chart(fig, use_container_width=True)
 
 
 # ── Campaigns tab ──
-def render_campaigns(df):
+def render_campaigns(df, campaigns_data):
     if df.empty:
         st.info("No campaign data available.")
         return
@@ -193,6 +330,17 @@ def render_campaigns(df):
     if camp_df.empty:
         st.info("No campaigns to compare.")
         return
+
+    # ── Frequency alerts ──
+    if "frequency" in df.columns:
+        high_freq = df[df["frequency"] > 3.0]
+        if not high_freq.empty:
+            freq_campaigns = high_freq["campaign_name"].unique()
+            st.warning(
+                f"⚠️ **High Frequency Alert**: {len(freq_campaigns)} campaign(s) "
+                f"have frequency > 3.0 — audiences may be experiencing ad fatigue.\n\n"
+                + ", ".join(f"**{c}**" for c in freq_campaigns[:5])
+            )
 
     st.subheader("Campaign Comparison")
 
@@ -235,10 +383,58 @@ def render_campaigns(df):
         fig.update_layout(showlegend=False, height=350, margin=dict(t=40, b=40))
         st.plotly_chart(fig, use_container_width=True)
 
+    # ── Budget pacing ──
+    if campaigns_data:
+        pacing_df = budget_pacing(campaigns_data, df)
+        pacing_df = pacing_df[pacing_df["budget"] > 0]
+        if not pacing_df.empty:
+            st.markdown("---")
+            st.subheader("Budget Pacing")
+
+            fig = go.Figure()
+            colors = []
+            for _, row in pacing_df.iterrows():
+                pct = row["pacing_pct"]
+                if pct < 80:
+                    colors.append("#2ca02c")  # Under budget — green
+                elif pct < 100:
+                    colors.append("#ff7f0e")  # Approaching — orange
+                else:
+                    colors.append("#d62728")  # Over budget — red
+
+            fig.add_trace(go.Bar(
+                y=pacing_df["campaign_name"],
+                x=pacing_df["actual_spend"],
+                orientation="h",
+                name="Actual Spend",
+                marker_color=colors,
+                text=pacing_df["pacing_pct"].map(lambda x: f"{x:.0f}%"),
+                textposition="auto",
+            ))
+            fig.add_trace(go.Bar(
+                y=pacing_df["campaign_name"],
+                x=pacing_df["budget"] - pacing_df["actual_spend"].clip(upper=pacing_df["budget"]),
+                orientation="h",
+                name="Remaining Budget",
+                marker_color="rgba(200,200,200,0.4)",
+            ))
+            fig.update_layout(
+                barmode="stack",
+                height=max(200, len(pacing_df) * 50),
+                margin=dict(t=20, b=40, l=20, r=20),
+                legend=dict(x=0, y=1.1, orientation="h"),
+                xaxis_title="Dollars ($)",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
 
 # ── Creatives tab ──
-def render_creatives(df, date_range):
-    ad_df = load_insights(date_range, "ad")
+def render_creatives(df, config):
+    ad_df = load_insights(
+        config["date_preset"], "ad",
+        since=config["custom_since"], until=config["custom_until"],
+        attribution_windows=config["attr_windows"],
+    )
     if ad_df.empty:
         st.info("No ad-level data available.")
         return
@@ -248,25 +444,46 @@ def render_creatives(df, date_range):
         st.info("No creative data to analyze.")
         return
 
+    # Fetch ad creative thumbnails
+    ads_data = load_ads()
+    creative_map = {}
+    for ad in ads_data:
+        ad_id = ad.get("id", "")
+        creative = ad.get("creative", {})
+        creative_map[ad_id] = {
+            "thumbnail_url": creative.get("thumbnail_url", ""),
+            "image_url": creative.get("image_url", ""),
+            "title": creative.get("title", ""),
+            "body": creative.get("body", ""),
+        }
+
     st.subheader("Ad Creative Performance")
 
-    display_df = creative_df[[
-        "ad_name", "spend", "impressions", "clicks",
-        "ctr", "total_conversions", "cost_per_conversion", "roas",
-    ]].copy()
-    display_df.columns = [
-        "Ad", "Spend", "Impressions", "Clicks",
-        "CTR (%)", "Conversions", "Cost/Conv", "ROAS",
-    ]
-    display_df["Spend"] = display_df["Spend"].map(lambda x: f"${x:,.2f}")
-    display_df["Impressions"] = display_df["Impressions"].map(lambda x: f"{x:,}")
-    display_df["Clicks"] = display_df["Clicks"].map(lambda x: f"{x:,}")
-    display_df["CTR (%)"] = display_df["CTR (%)"].map(lambda x: f"{x:.2f}%")
-    display_df["Conversions"] = display_df["Conversions"].map(lambda x: f"{x:,.0f}")
-    display_df["Cost/Conv"] = display_df["Cost/Conv"].map(lambda x: f"${x:,.2f}")
-    display_df["ROAS"] = display_df["ROAS"].map(lambda x: f"{x:.2f}x")
+    # Show creatives with thumbnails
+    for _, row in creative_df.iterrows():
+        ad_id = row.get("ad_id", "")
+        creative_info = creative_map.get(ad_id, {})
+        thumb = creative_info.get("thumbnail_url") or creative_info.get("image_url")
 
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+        col_img, col_data = st.columns([1, 4])
+
+        with col_img:
+            if thumb:
+                st.image(thumb, width=120)
+            else:
+                st.markdown("🖼️ *No preview*")
+
+        with col_data:
+            st.markdown(f"**{row['ad_name']}**")
+            mcols = st.columns(6)
+            mcols[0].metric("Spend", f"${row['spend']:,.2f}")
+            mcols[1].metric("Impressions", f"{row['impressions']:,}")
+            mcols[2].metric("Clicks", f"{row['clicks']:,}")
+            mcols[3].metric("CTR", f"{row['ctr']:.2f}%")
+            mcols[4].metric("Conversions", f"{row['total_conversions']:,.0f}")
+            mcols[5].metric("ROAS", f"{row['roas']:.2f}x")
+
+        st.markdown("---")
 
     # Scatter: spend vs conversions
     if len(creative_df) > 1:
@@ -288,7 +505,7 @@ def render_creatives(df, date_range):
 
 
 # ── Audience tab ──
-def render_audience(date_range):
+def render_audience(config):
     st.subheader("Audience Breakdowns")
 
     breakdown_choice = st.selectbox(
@@ -298,7 +515,11 @@ def render_audience(date_range):
     )
 
     with st.spinner(f"Loading {breakdown_choice} breakdown..."):
-        bd_df = load_insights_with_breakdown(date_range, "campaign", breakdown_choice)
+        bd_df = load_insights_with_breakdown(
+            config["date_preset"], "campaign", breakdown_choice,
+            since=config["custom_since"], until=config["custom_until"],
+            attribution_windows=config["attr_windows"],
+        )
 
     if bd_df.empty:
         st.info(f"No {breakdown_choice} data available.")
@@ -355,6 +576,28 @@ def render_raw_data(df):
     )
 
 
+# ── Slack report ──
+def send_slack_report(webhook_url, summary, account_name, date_label):
+    """Post a formatted summary to Slack via incoming webhook."""
+    text = (
+        f"📊 *Meta Ads Report — {account_name}*\n"
+        f"Period: {date_label}\n\n"
+        f"💰 Spend: {format_currency(summary['total_spend'])}\n"
+        f"👁️ Impressions: {format_number(summary['total_impressions'])}\n"
+        f"🖱️ Clicks: {format_number(summary['total_clicks'])}\n"
+        f"📈 CTR: {format_pct(summary['avg_ctr'])}\n"
+        f"🎯 Conversions: {format_number(summary['total_conversions'])}\n"
+        f"💎 ROAS: {format_roas(summary['roas'])}\n"
+        f"💵 CPC: {format_currency(summary['avg_cpc'])}\n"
+        f"📉 Cost/Conv: {format_currency(summary['cost_per_conversion'])}"
+    )
+    try:
+        resp = req_lib.post(webhook_url, json={"text": text}, timeout=10)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 # ── Main app ──
 def main():
     if not _check_credentials():
@@ -370,40 +613,98 @@ def main():
         )
         return
 
-    date_range, level = render_sidebar()
+    config = render_sidebar()
+    date_preset = config["date_preset"]
+    level = config["level"]
 
     st.title("Meta Ads Dashboard")
     st.caption("Live data from Meta Marketing API")
 
-    # Fetch main data
+    # ── Fetch main data ──
     with st.spinner("Loading data from Meta Ads API..."):
-        df = load_insights(date_range, level)
+        df = load_insights(
+            date_preset, level,
+            since=config["custom_since"], until=config["custom_until"],
+            attribution_windows=config["attr_windows"],
+        )
+
+    # ── Filter by campaign status ──
+    campaigns_data = load_campaigns()
+    if config["statuses"] and not df.empty and "campaign_id" in df.columns:
+        active_ids = {
+            c["id"] for c in campaigns_data
+            if c.get("status") in config["statuses"]
+        }
+        if active_ids:
+            df = df[df["campaign_id"].isin(active_ids)]
 
     if df.empty:
-        st.warning("No data returned for the selected date range. Try a different range.")
+        st.warning("No data returned for the selected filters. Try a different range or status.")
         return
 
+    # ── Period-over-period comparison ──
     summary = summary_metrics(df)
-    render_kpis(summary)
+    comparison = None
+
+    if date_preset:
+        cs, cu, ps, pu = get_comparison_dates(date_preset)
+        if cs and ps:
+            try:
+                prev_df = load_insights(
+                    None, level, since=ps, until=pu,
+                    attribution_windows=config["attr_windows"],
+                )
+                if config["statuses"] and not prev_df.empty and "campaign_id" in prev_df.columns:
+                    active_ids = {
+                        c["id"] for c in campaigns_data
+                        if c.get("status") in config["statuses"]
+                    }
+                    if active_ids:
+                        prev_df = prev_df[prev_df["campaign_id"].isin(active_ids)]
+                if not prev_df.empty:
+                    prev_summary = summary_metrics(prev_df)
+                    comparison = period_comparison(summary, prev_summary)
+            except Exception:
+                pass  # Comparison is optional, don't break the dashboard
+
+    render_kpis(summary, comparison)
+
+    # ── Slack report button ──
+    webhook = config.get("slack_webhook", "")
+    if webhook:
+        col_slack, _ = st.columns([1, 5])
+        with col_slack:
+            if st.button("📤 Send to Slack"):
+                accounts = get_accounts()
+                acct = get_active_account()
+                acct_name = accounts.get(acct, acct)
+                date_label = date_preset or f"{config['custom_since']} to {config['custom_until']}"
+                if send_slack_report(webhook, summary, acct_name, date_label):
+                    st.success("Sent!")
+                else:
+                    st.error("Failed to send. Check your webhook URL.")
 
     st.markdown("---")
 
-    # Tabs
-    tab_overview, tab_campaigns, tab_creatives, tab_audience, tab_raw = st.tabs(
-        ["Overview", "Campaigns", "Creatives", "Audience", "Raw Data"]
+    # ── Tabs ──
+    tab_overview, tab_funnel, tab_campaigns, tab_creatives, tab_audience, tab_raw = st.tabs(
+        ["Overview", "Funnel", "Campaigns", "Creatives", "Audience", "Raw Data"]
     )
 
     with tab_overview:
-        render_overview(df, date_range)
+        render_overview(df, config)
+
+    with tab_funnel:
+        render_funnel(df)
 
     with tab_campaigns:
-        render_campaigns(df)
+        render_campaigns(df, campaigns_data)
 
     with tab_creatives:
-        render_creatives(df, date_range)
+        render_creatives(df, config)
 
     with tab_audience:
-        render_audience(date_range)
+        render_audience(config)
 
     with tab_raw:
         render_raw_data(df)

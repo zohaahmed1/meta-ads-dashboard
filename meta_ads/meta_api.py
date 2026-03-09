@@ -9,6 +9,7 @@ import os
 import sys
 import json
 from pathlib import Path
+from datetime import datetime, timedelta
 
 # ── Load .env file if present (for local dev) ──
 _env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -107,6 +108,42 @@ def set_active_account(account_id):
 def get_accounts():
     """Return dict of {account_id: display_name} for all configured accounts."""
     return dict(AD_ACCOUNTS)
+
+
+ATTRIBUTION_WINDOWS = ["1d_click", "7d_click", "28d_click", "1d_view", "7d_view"]
+
+
+def get_comparison_dates(date_preset):
+    """Return (current_since, current_until, prev_since, prev_until) for period-over-period comparison."""
+    today = datetime.now().date()
+
+    if date_preset == "today":
+        return today.isoformat(), today.isoformat(), (today - timedelta(days=1)).isoformat(), (today - timedelta(days=1)).isoformat()
+    elif date_preset == "yesterday":
+        d = today - timedelta(days=1)
+        return d.isoformat(), d.isoformat(), (d - timedelta(days=1)).isoformat(), (d - timedelta(days=1)).isoformat()
+    elif date_preset in ("last_7d", "last_14d", "last_30d"):
+        days = int(date_preset.split("_")[1].replace("d", ""))
+        cur_start = (today - timedelta(days=days)).isoformat()
+        cur_end = (today - timedelta(days=1)).isoformat()
+        prev_start = (today - timedelta(days=days * 2)).isoformat()
+        prev_end = (today - timedelta(days=days + 1)).isoformat()
+        return cur_start, cur_end, prev_start, prev_end
+    elif date_preset == "this_month":
+        cur_start = today.replace(day=1)
+        days_so_far = (today - cur_start).days + 1
+        prev_end = cur_start - timedelta(days=1)
+        prev_start = prev_end - timedelta(days=days_so_far - 1)
+        return cur_start.isoformat(), today.isoformat(), prev_start.isoformat(), prev_end.isoformat()
+    elif date_preset == "last_month":
+        first_of_current = today.replace(day=1)
+        last_of_prev = first_of_current - timedelta(days=1)
+        first_of_prev = last_of_prev.replace(day=1)
+        two_ago_end = first_of_prev - timedelta(days=1)
+        two_ago_start = two_ago_end.replace(day=1)
+        return first_of_prev.isoformat(), last_of_prev.isoformat(), two_ago_start.isoformat(), two_ago_end.isoformat()
+
+    return None, None, None, None
 
 
 def _check_credentials():
@@ -208,17 +245,21 @@ def _paginate(initial_response):
 def fetch_insights(date_preset="last_7d", level="campaign",
                    breakdowns=None, fields=None,
                    time_increment=None, limit=500,
-                   account_id=None):
+                   account_id=None, since=None, until=None,
+                   action_attribution_windows=None):
     """Fetch insights from the Meta Marketing API.
 
     Args:
-        date_preset: one of VALID_DATE_PRESETS
+        date_preset: one of VALID_DATE_PRESETS (ignored if since/until set)
         level: 'campaign', 'adset', or 'ad'
         breakdowns: list of breakdown dimensions, e.g. ['age', 'gender']
         fields: list of field names (defaults to INSIGHT_FIELDS)
         time_increment: int for daily (1) or weekly (7) grouping
         limit: results per page (max 500)
         account_id: override active account (optional)
+        since: start date str YYYY-MM-DD (used with until for custom range)
+        until: end date str YYYY-MM-DD
+        action_attribution_windows: list like ['7d_click', '1d_view']
 
     Returns: list of insight dicts
     """
@@ -228,15 +269,21 @@ def fetch_insights(date_preset="last_7d", level="campaign",
 
     params = {
         "fields": ",".join(fields),
-        "date_preset": date_preset,
         "level": level,
         "limit": limit,
     }
+
+    if since and until:
+        params["time_range"] = json.dumps({"since": since, "until": until})
+    else:
+        params["date_preset"] = date_preset
 
     if breakdowns:
         params["breakdowns"] = ",".join(breakdowns)
     if time_increment:
         params["time_increment"] = str(time_increment)
+    if action_attribution_windows:
+        params["action_attribution_windows"] = json.dumps(action_attribution_windows)
 
     response = meta_api_get(f"{acc}/insights", params)
     return _paginate(response)
