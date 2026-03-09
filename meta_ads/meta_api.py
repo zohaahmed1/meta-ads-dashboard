@@ -20,12 +20,16 @@ if _env_path.exists():
             os.environ.setdefault(k.strip(), v.strip())
 
 # ── Load Streamlit Cloud secrets (if running on Streamlit Cloud) ──
+_st_secrets = {}
 try:
     import streamlit as st
     if hasattr(st, "secrets"):
         for key in ["META_ACCESS_TOKEN", "META_AD_ACCOUNT_IDS", "META_AD_ACCOUNT_NAMES"]:
-            if key in st.secrets:
-                os.environ.setdefault(key, st.secrets[key])
+            try:
+                if key in st.secrets:
+                    _st_secrets[key] = st.secrets[key]
+            except Exception:
+                pass
 except Exception:
     pass
 
@@ -33,11 +37,20 @@ except Exception:
 META_API_VERSION = "v21.0"
 META_BASE_URL = f"https://graph.facebook.com/{META_API_VERSION}"
 
-META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", "")
+META_ACCESS_TOKEN = (
+    _st_secrets.get("META_ACCESS_TOKEN")
+    or os.environ.get("META_ACCESS_TOKEN", "")
+)
 
 # Multi-account support: comma-separated IDs and names
-_raw_ids = os.environ.get("META_AD_ACCOUNT_IDS", os.environ.get("META_AD_ACCOUNT_ID", ""))
-_raw_names = os.environ.get("META_AD_ACCOUNT_NAMES", "")
+_raw_ids = (
+    _st_secrets.get("META_AD_ACCOUNT_IDS")
+    or os.environ.get("META_AD_ACCOUNT_IDS", os.environ.get("META_AD_ACCOUNT_ID", ""))
+)
+_raw_names = (
+    _st_secrets.get("META_AD_ACCOUNT_NAMES")
+    or os.environ.get("META_AD_ACCOUNT_NAMES", "")
+)
 
 AD_ACCOUNTS = {}  # {account_id: display_name}
 _ids = [x.strip() for x in _raw_ids.split(",") if x.strip()]
