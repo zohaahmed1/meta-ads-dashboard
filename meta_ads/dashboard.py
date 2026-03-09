@@ -139,7 +139,7 @@ def render_sidebar():
         date_preset = st.sidebar.selectbox(
             "Date Range",
             VALID_DATE_PRESETS,
-            index=VALID_DATE_PRESETS.index("last_7d"),
+            index=VALID_DATE_PRESETS.index("last_30d"),
             format_func=lambda x: x.replace("_", " ").title(),
         )
     else:
@@ -152,10 +152,11 @@ def render_sidebar():
         custom_since = custom_start.isoformat()
         custom_until = custom_end.isoformat()
 
-    # ── Campaign status filter ──
+    # ── Campaign status filter (default: all = no filter) ──
     status_options = ["ACTIVE", "PAUSED", "ARCHIVED"]
     selected_statuses = st.sidebar.multiselect(
-        "Campaign Status", status_options, default=["ACTIVE"],
+        "Campaign Status", status_options, default=[],
+        placeholder="All statuses (no filter)",
     )
 
     # ── Reporting level ──
@@ -798,15 +799,39 @@ def main():
             df = df[df["campaign_id"].isin(active_ids)]
 
     if df.empty:
-        # Show more helpful message based on what filters are set
-        msg = "No data returned for the selected filters."
-        hints = []
-        if config["statuses"] == ["ACTIVE"]:
-            hints.append("Try adding **PAUSED** to the Campaign Status filter — campaigns may not be active right now.")
-        if date_preset == "last_7d" or date_preset == "today" or date_preset == "yesterday":
-            hints.append("Try a longer date range like **Last 30D** or **Last Month**.")
-        hint_str = " ".join(hints) if hints else "Try a different range or status."
-        st.warning(f"{msg} {hint_str}")
+        st.warning("No data returned for the selected filters.")
+
+        # ── Diagnostics: help the user figure out why ──
+        with st.expander("Troubleshooting Info", expanded=True):
+            st.markdown(f"**Account ID:** `{account_id}`")
+            date_label = date_preset or f"{config['custom_since']} → {config['custom_until']}"
+            st.markdown(f"**Date range:** {date_label}")
+            st.markdown(f"**Status filter:** {config['statuses'] if config['statuses'] else 'None (all)'}")
+
+            # Check what campaigns actually exist
+            if campaigns_data:
+                statuses_found = {}
+                for c in campaigns_data:
+                    s = c.get("status", "UNKNOWN")
+                    statuses_found[s] = statuses_found.get(s, 0) + 1
+                st.markdown(f"**Campaigns in account:** {len(campaigns_data)}")
+                for s, count in statuses_found.items():
+                    st.markdown(f"  - {s}: {count}")
+            else:
+                st.markdown("**Campaigns in account:** 0 (or API error)")
+
+            # Check if raw insights came back before filtering
+            raw_df = load_insights(
+                account_id, date_preset, level,
+                since=config["custom_since"], until=config["custom_until"],
+                attribution_windows=config["attr_windows"],
+            )
+            st.markdown(f"**Raw insight rows (before status filter):** {len(raw_df)}")
+
+            if len(raw_df) > 0 and config["statuses"]:
+                st.info("Data exists but was filtered out by the Campaign Status filter. Clear the status filter to see all data.")
+            elif len(raw_df) == 0:
+                st.info("The Meta API returned no data for this account and date range. The account may not have had any ad spend in this period.")
         return
 
     # ── Period-over-period comparison ──
