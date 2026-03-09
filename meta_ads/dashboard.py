@@ -64,39 +64,42 @@ st.set_page_config(
 
 
 # ── Cached data fetchers ──
+# NOTE: account_id is included in all cache keys so switching accounts works correctly.
 @st.cache_data(ttl=300, show_spinner=False)
-def load_insights(date_preset, level, time_increment=None,
+def load_insights(account_id, date_preset, level, time_increment=None,
                   since=None, until=None, attribution_windows=None):
     raw = fetch_insights(
         date_preset=date_preset, level=level, time_increment=time_increment,
         since=since, until=until, action_attribution_windows=attribution_windows,
+        account_id=account_id,
     )
     return insights_to_dataframe(raw)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_insights_with_breakdown(date_preset, level, breakdown,
+def load_insights_with_breakdown(account_id, date_preset, level, breakdown,
                                  since=None, until=None, attribution_windows=None):
     raw = fetch_insights(
         date_preset=date_preset, level=level, breakdowns=[breakdown],
         since=since, until=until, action_attribution_windows=attribution_windows,
+        account_id=account_id,
     )
     return insights_to_dataframe(raw)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_campaigns():
-    return fetch_campaigns()
+def load_campaigns(account_id):
+    return fetch_campaigns(account_id=account_id)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_ads():
-    return fetch_ads()
+def load_ads(account_id):
+    return fetch_ads(account_id=account_id)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_creative_thumbnails():
-    return get_creative_thumbnails()
+def load_creative_thumbnails(account_id):
+    return get_creative_thumbnails(account_id=account_id)
 
 
 # ── Sidebar ──
@@ -106,15 +109,18 @@ def render_sidebar():
 
     # Account selector
     accounts = get_accounts()
+    active_account_id = ""
     if len(accounts) > 1:
         account_ids = list(accounts.keys())
         account_labels = [f"{accounts[a]}" for a in account_ids]
         selected_label = st.sidebar.selectbox("Ad Account", account_labels)
         selected_idx = account_labels.index(selected_label)
-        set_active_account(account_ids[selected_idx])
+        active_account_id = account_ids[selected_idx]
+        set_active_account(active_account_id)
     elif accounts:
         only_id = list(accounts.keys())[0]
         st.sidebar.text(f"Account: {accounts[only_id]}")
+        active_account_id = only_id
         set_active_account(only_id)
 
     st.sidebar.markdown("---")
@@ -192,6 +198,7 @@ def render_sidebar():
         st.rerun()
 
     return {
+        "account_id": active_account_id,
         "date_preset": date_preset,
         "custom_since": custom_since,
         "custom_until": custom_until,
@@ -268,7 +275,7 @@ def render_overview(df, config):
         return
 
     daily_df = load_insights(
-        config["date_preset"], "campaign", time_increment=1,
+        config["account_id"], config["date_preset"], "campaign", time_increment=1,
         since=config["custom_since"], until=config["custom_until"],
         attribution_windows=config["attr_windows"],
     )
@@ -439,7 +446,7 @@ def render_campaigns(df, campaigns_data):
 # ── Creatives tab ──
 def render_creatives(df, config):
     ad_df = load_insights(
-        config["date_preset"], "ad",
+        config["account_id"], config["date_preset"], "ad",
         since=config["custom_since"], until=config["custom_until"],
         attribution_windows=config["attr_windows"],
     )
@@ -454,7 +461,7 @@ def render_creatives(df, config):
 
     # Fetch ad creative thumbnails via the /adcreatives endpoint (reliable)
     # 1. Map ad_id -> creative_id from ads data
-    ads_data = load_ads()
+    ads_data = load_ads(config["account_id"])
     ad_to_creative = {}
     for ad in ads_data:
         ad_id = ad.get("id", "")
@@ -463,7 +470,7 @@ def render_creatives(df, config):
             ad_to_creative[ad_id] = creative["id"]
 
     # 2. Get creative_id -> thumbnail_url from creatives endpoint
-    creative_thumbs = load_creative_thumbnails()
+    creative_thumbs = load_creative_thumbnails(config["account_id"])
 
     # 3. Build ad_id -> thumbnail_url
     creative_map = {}
@@ -541,7 +548,7 @@ def render_audience(config):
 
     with st.spinner(f"Loading {breakdown_choice} breakdown..."):
         bd_df = load_insights_with_breakdown(
-            config["date_preset"], "campaign", breakdown_choice,
+            config["account_id"], config["date_preset"], "campaign", breakdown_choice,
             since=config["custom_since"], until=config["custom_until"],
             attribution_windows=config["attr_windows"],
         )
@@ -770,16 +777,18 @@ def main():
     st.title("Meta Ads Dashboard")
     st.caption("Live data from Meta Marketing API")
 
+    account_id = config["account_id"]
+
     # ── Fetch main data ──
     with st.spinner("Loading data from Meta Ads API..."):
         df = load_insights(
-            date_preset, level,
+            account_id, date_preset, level,
             since=config["custom_since"], until=config["custom_until"],
             attribution_windows=config["attr_windows"],
         )
 
     # ── Filter by campaign status ──
-    campaigns_data = load_campaigns()
+    campaigns_data = load_campaigns(account_id)
     if config["statuses"] and not df.empty and "campaign_id" in df.columns:
         active_ids = {
             c["id"] for c in campaigns_data
@@ -789,7 +798,15 @@ def main():
             df = df[df["campaign_id"].isin(active_ids)]
 
     if df.empty:
-        st.warning("No data returned for the selected filters. Try a different range or status.")
+        # Show more helpful message based on what filters are set
+        msg = "No data returned for the selected filters."
+        hints = []
+        if config["statuses"] == ["ACTIVE"]:
+            hints.append("Try adding **PAUSED** to the Campaign Status filter — campaigns may not be active right now.")
+        if date_preset == "last_7d" or date_preset == "today" or date_preset == "yesterday":
+            hints.append("Try a longer date range like **Last 30D** or **Last Month**.")
+        hint_str = " ".join(hints) if hints else "Try a different range or status."
+        st.warning(f"{msg} {hint_str}")
         return
 
     # ── Period-over-period comparison ──
@@ -801,7 +818,7 @@ def main():
         if cs and ps:
             try:
                 prev_df = load_insights(
-                    None, level, since=ps, until=pu,
+                    account_id, None, level, since=ps, until=pu,
                     attribution_windows=config["attr_windows"],
                 )
                 if config["statuses"] and not prev_df.empty and "campaign_id" in prev_df.columns:
