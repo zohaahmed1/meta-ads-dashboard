@@ -346,6 +346,41 @@ def fetch_ads(adset_id=None, account_id=None):
     return _paginate(response)
 
 
+def fetch_creatives(account_id=None):
+    """Fetch all ad creatives with thumbnail URLs directly from the creatives endpoint.
+
+    The /adcreatives endpoint reliably returns thumbnail_url, unlike the
+    creative sub-field on the ads endpoint.
+
+    Returns: list of creative dicts with id, thumbnail_url, image_url, etc.
+    """
+    acc = account_id or _active_account_id
+    fields = [
+        "id", "name", "thumbnail_url", "image_url",
+        "title", "body", "call_to_action_type",
+    ]
+    params = {"fields": ",".join(fields), "limit": 500}
+    response = meta_api_get(f"{acc}/adcreatives", params)
+    return _paginate(response)
+
+
+def get_creative_thumbnails(account_id=None):
+    """Build a mapping of creative_id -> thumbnail URL.
+
+    Tries thumbnail_url first, falls back to image_url.
+
+    Returns: dict {creative_id: url}
+    """
+    creatives = fetch_creatives(account_id=account_id)
+    result = {}
+    for c in creatives:
+        cid = c.get("id", "")
+        url = c.get("thumbnail_url") or c.get("image_url") or ""
+        if cid and url:
+            result[cid] = url
+    return result
+
+
 # ── Quick smoke test ──
 if __name__ == "__main__":
     print("=" * 60)

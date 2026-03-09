@@ -35,6 +35,7 @@ from meta_ads.meta_api import (
     VALID_LEVELS, VALID_BREAKDOWNS, _check_credentials,
     get_accounts, set_active_account, get_active_account,
     get_comparison_dates, ATTRIBUTION_WINDOWS,
+    get_creative_thumbnails,
 )
 from meta_ads.metrics import (
     insights_to_dataframe, summary_metrics, daily_trend,
@@ -89,6 +90,11 @@ def load_campaigns():
 @st.cache_data(ttl=600, show_spinner=False)
 def load_ads():
     return fetch_ads()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_creative_thumbnails():
+    return get_creative_thumbnails()
 
 
 # ── Sidebar ──
@@ -444,26 +450,30 @@ def render_creatives(df, config):
         st.info("No creative data to analyze.")
         return
 
-    # Fetch ad creative thumbnails
+    # Fetch ad creative thumbnails via the /adcreatives endpoint (reliable)
+    # 1. Map ad_id -> creative_id from ads data
     ads_data = load_ads()
-    creative_map = {}
+    ad_to_creative = {}
     for ad in ads_data:
         ad_id = ad.get("id", "")
         creative = ad.get("creative", {})
-        creative_map[ad_id] = {
-            "thumbnail_url": creative.get("thumbnail_url", ""),
-            "image_url": creative.get("image_url", ""),
-            "title": creative.get("title", ""),
-            "body": creative.get("body", ""),
-        }
+        if ad_id and creative.get("id"):
+            ad_to_creative[ad_id] = creative["id"]
+
+    # 2. Get creative_id -> thumbnail_url from creatives endpoint
+    creative_thumbs = load_creative_thumbnails()
+
+    # 3. Build ad_id -> thumbnail_url
+    creative_map = {}
+    for ad_id, creative_id in ad_to_creative.items():
+        creative_map[ad_id] = creative_thumbs.get(creative_id, "")
 
     st.subheader("Ad Creative Performance")
 
     # Show creatives with thumbnails
     for _, row in creative_df.iterrows():
         ad_id = row.get("ad_id", "")
-        creative_info = creative_map.get(ad_id, {})
-        thumb = creative_info.get("thumbnail_url") or creative_info.get("image_url")
+        thumb = creative_map.get(ad_id, "")
 
         col_img, col_data = st.columns([1, 4])
 
