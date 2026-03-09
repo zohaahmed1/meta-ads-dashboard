@@ -374,6 +374,100 @@ def budget_pacing(campaigns, insights_df):
     return pd.DataFrame(rows).sort_values("actual_spend", ascending=False)
 
 
+def generate_recommendations(camp_df, summary):
+    """Generate actionable optimization recommendations from campaign data.
+
+    Args:
+        camp_df: DataFrame from campaign_comparison()
+        summary: dict from summary_metrics()
+
+    Returns: list of (icon, message) tuples sorted by severity
+    """
+    if camp_df.empty:
+        return []
+
+    recs = []
+    avg_roas = summary.get("roas", 0)
+    avg_cpc = summary.get("avg_cpc", 0)
+    avg_ctr = summary.get("avg_ctr", 0)
+    avg_cost_per_conv = summary.get("cost_per_conversion", 0)
+    total_spend = summary.get("total_spend", 1)
+
+    for _, row in camp_df.iterrows():
+        name = row["campaign_name"]
+        roas = row.get("roas", 0)
+        spend = row.get("spend", 0)
+        ctr = row.get("ctr", 0)
+        cost_per = row.get("cost_per_conversion", 0)
+        convs = row.get("total_conversions", 0)
+        spend_share = (spend / total_spend * 100) if total_spend > 0 else 0
+
+        # High spend + low ROAS → pause/reduce
+        if roas < 1.0 and spend_share > 10:
+            recs.append((1, "🔴", f"**{name}** — ROAS {roas:.2f}x on {spend_share:.0f}% of total spend. Consider pausing or cutting budget."))
+
+        # High ROAS + low spend share → scale
+        elif roas > avg_roas * 1.5 and roas > 1.5 and spend_share < 40:
+            recs.append((3, "🟢", f"**{name}** — {roas:.2f}x ROAS, only {spend_share:.0f}% of budget. Strong candidate to scale."))
+
+        # Low CTR → creative/targeting issue
+        if ctr < avg_ctr * 0.5 and spend > 0:
+            recs.append((2, "🟡", f"**{name}** — CTR {ctr:.2f}% is well below average ({avg_ctr:.2f}%). Test new creatives or tighten targeting."))
+
+        # Expensive conversions
+        if avg_cost_per_conv > 0 and cost_per > avg_cost_per_conv * 2 and convs > 0:
+            recs.append((2, "🟡", f"**{name}** — Cost/conversion ${cost_per:,.2f} is 2x+ above account average. Review audiences."))
+
+        # Zero conversions with meaningful spend
+        if convs == 0 and spend > total_spend * 0.05:
+            recs.append((1, "🔴", f"**{name}** — ${spend:,.0f} spent with zero conversions. Pause or restructure."))
+
+    # Account-level insights
+    if avg_roas > 0 and avg_roas < 1.0:
+        recs.append((1, "🔴", f"Account-wide ROAS is {avg_roas:.2f}x — spending more than you're earning. Review all campaigns."))
+
+    if avg_ctr < 1.0:
+        recs.append((2, "🟡", f"Account CTR is {avg_ctr:.2f}% — below 1% benchmark. Test new ad formats or creative angles."))
+
+    # Sort by priority (1=critical, 2=warning, 3=opportunity)
+    recs.sort(key=lambda x: x[0])
+    return [(icon, msg) for _, icon, msg in recs]
+
+
+def efficiency_quadrant(camp_df):
+    """Classify campaigns into efficiency quadrants based on ROAS and spend share.
+
+    Quadrants:
+      - Stars: High ROAS, high spend — scale winners
+      - Question Marks: High ROAS, low spend — test & scale
+      - Cash Cows: Low ROAS, high spend — optimize or cut
+      - Dogs: Low ROAS, low spend — pause
+
+    Returns: camp_df with added 'quadrant' column
+    """
+    if camp_df.empty:
+        return camp_df
+
+    df = camp_df.copy()
+    median_roas = df["roas"].median()
+    median_spend = df["spend"].median()
+
+    def classify(row):
+        high_roas = row["roas"] >= median_roas
+        high_spend = row["spend"] >= median_spend
+        if high_roas and high_spend:
+            return "Stars"
+        elif high_roas and not high_spend:
+            return "Question Marks"
+        elif not high_roas and high_spend:
+            return "Cash Cows"
+        else:
+            return "Dogs"
+
+    df["quadrant"] = df.apply(classify, axis=1)
+    return df
+
+
 def top_performers(df, metric="roas", n=10, ascending=False):
     """Return top N rows by a given metric.
 

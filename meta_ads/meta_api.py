@@ -347,27 +347,47 @@ def fetch_ads(adset_id=None, account_id=None):
 
 
 def fetch_creatives(account_id=None):
-    """Fetch all ad creatives with thumbnail URLs directly from the creatives endpoint.
+    """Fetch all ad creatives with thumbnail/image URLs.
 
-    The /adcreatives endpoint reliably returns thumbnail_url, unlike the
-    creative sub-field on the ads endpoint.
+    Uses multiple fields to maximize chances of getting a preview image:
+    - thumbnail_url: works for video creatives
+    - image_url: works for some image creatives
+    - object_story_spec: contains image link for feed ads
 
-    Returns: list of creative dicts with id, thumbnail_url, image_url, etc.
+    Returns: list of creative dicts
     """
     acc = account_id or _active_account_id
     fields = [
         "id", "name", "thumbnail_url", "image_url",
-        "title", "body", "call_to_action_type",
+        "object_story_spec", "title", "body",
     ]
     params = {"fields": ",".join(fields), "limit": 500}
     response = meta_api_get(f"{acc}/adcreatives", params)
     return _paginate(response)
 
 
+def fetch_ad_previews(ad_ids, account_id=None):
+    """Fetch ad preview iframes for a list of ad IDs.
+
+    Uses the /previews edge on each ad to get a rendered preview.
+    Returns: dict {ad_id: preview_html}
+    """
+    result = {}
+    for ad_id in ad_ids:
+        response = meta_api_get(f"{ad_id}/previews", {
+            "ad_format": "DESKTOP_FEED_STANDARD",
+        })
+        if response and response.get("data"):
+            html = response["data"][0].get("body", "")
+            result[ad_id] = html
+        time.sleep(0.3)  # Be gentle with rate limits
+    return result
+
+
 def get_creative_thumbnails(account_id=None):
     """Build a mapping of creative_id -> thumbnail URL.
 
-    Tries thumbnail_url first, falls back to image_url.
+    Priority: thumbnail_url > image_url > object_story_spec image.
 
     Returns: dict {creative_id: url}
     """
@@ -375,8 +395,28 @@ def get_creative_thumbnails(account_id=None):
     result = {}
     for c in creatives:
         cid = c.get("id", "")
+        if not cid:
+            continue
+
+        # Try direct fields first
         url = c.get("thumbnail_url") or c.get("image_url") or ""
-        if cid and url:
+
+        # Fall back to object_story_spec (contains image for feed ads)
+        if not url:
+            oss = c.get("object_story_spec", {})
+            # Link ads
+            link_data = oss.get("link_data", {})
+            url = link_data.get("image_url") or link_data.get("picture") or ""
+            # Photo ads
+            if not url:
+                photo_data = oss.get("photo_data", {})
+                url = photo_data.get("url") or photo_data.get("image_url") or ""
+            # Video ads
+            if not url:
+                video_data = oss.get("video_data", {})
+                url = video_data.get("image_url") or ""
+
+        if url:
             result[cid] = url
     return result
 
