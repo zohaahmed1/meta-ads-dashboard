@@ -468,6 +468,167 @@ def efficiency_quadrant(camp_df):
     return df
 
 
+def day_of_week_performance(df):
+    """Aggregate metrics by day of week to find best/worst performing days.
+
+    Returns: DataFrame with day name, spend, clicks, conversions, ctr, cpc, roas
+    """
+    if df.empty or "date_start" not in df.columns:
+        return pd.DataFrame()
+
+    df2 = df.copy()
+    df2["day_of_week"] = pd.to_datetime(df2["date_start"]).dt.day_name()
+
+    grouped = df2.groupby("day_of_week").agg({
+        "spend": "sum",
+        "impressions": "sum",
+        "clicks": "sum",
+        "total_conversions": "sum",
+        "conversion_value": "sum",
+    }).reset_index()
+
+    grouped["ctr"] = (grouped["clicks"] / grouped["impressions"] * 100).fillna(0)
+    grouped["cpc"] = (grouped["spend"] / grouped["clicks"]).fillna(0)
+    grouped["cost_per_conversion"] = (grouped["spend"] / grouped["total_conversions"]).fillna(0)
+    grouped["roas"] = (grouped["conversion_value"] / grouped["spend"]).fillna(0)
+
+    # Sort by standard weekday order
+    day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    grouped["day_order"] = grouped["day_of_week"].map({d: i for i, d in enumerate(day_order)})
+    grouped = grouped.sort_values("day_order").drop(columns=["day_order"])
+    return grouped
+
+
+def spend_efficiency_curve(df):
+    """Calculate cumulative spend vs cumulative conversions to show diminishing returns.
+
+    Campaigns are sorted by cost_per_conversion (most efficient first).
+    Returns: DataFrame with cumulative_spend, cumulative_conversions, campaign_name
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    camp = campaign_comparison(df)
+    if camp.empty:
+        return pd.DataFrame()
+
+    # Sort by efficiency (lowest cost per conversion first)
+    camp = camp[camp["total_conversions"] > 0].copy()
+    if camp.empty:
+        return pd.DataFrame()
+
+    camp = camp.sort_values("cost_per_conversion", ascending=True)
+    camp["cumulative_spend"] = camp["spend"].cumsum()
+    camp["cumulative_conversions"] = camp["total_conversions"].cumsum()
+    camp["marginal_cpa"] = camp["spend"] / camp["total_conversions"]
+    return camp[["campaign_name", "spend", "total_conversions", "cost_per_conversion",
+                  "cumulative_spend", "cumulative_conversions", "marginal_cpa"]]
+
+
+def detect_anomalies(df, metric="spend", threshold=2.0):
+    """Detect daily anomalies using z-score method.
+
+    Args:
+        df: daily trend DataFrame (must have date_start and the metric column)
+        metric: which metric to check for anomalies
+        threshold: z-score threshold (default 2.0 = ~95% confidence)
+
+    Returns: DataFrame of anomalous days with z-scores
+    """
+    if df.empty or metric not in df.columns or len(df) < 3:
+        return pd.DataFrame()
+
+    mean = df[metric].mean()
+    std = df[metric].std()
+    if std == 0:
+        return pd.DataFrame()
+
+    df2 = df.copy()
+    df2["z_score"] = (df2[metric] - mean) / std
+    anomalies = df2[df2["z_score"].abs() > threshold].copy()
+    anomalies["direction"] = anomalies["z_score"].apply(lambda z: "spike" if z > 0 else "drop")
+    return anomalies
+
+
+def spend_allocation_score(camp_df):
+    """Score how well spend is allocated across campaigns (0-100).
+
+    Perfect score = all spend goes to highest-ROAS campaigns.
+    Low score = high spend on low-ROAS campaigns.
+
+    Returns: dict with score, interpretation, and details
+    """
+    if camp_df.empty or len(camp_df) < 2:
+        return {"score": 0, "interpretation": "Not enough campaigns to score", "details": []}
+
+    df = camp_df.copy()
+    total_spend = df["spend"].sum()
+    if total_spend == 0:
+        return {"score": 0, "interpretation": "No spend data", "details": []}
+
+    df["spend_share"] = df["spend"] / total_spend
+    df["roas_rank"] = df["roas"].rank(ascending=False, method="min")
+    df["ideal_rank"] = df["spend"].rank(ascending=False, method="min")
+
+    # Score: correlation between ROAS rank and spend rank
+    # If highest ROAS campaigns get highest spend, correlation is high
+    n = len(df)
+    if n < 2:
+        return {"score": 50, "interpretation": "Single campaign", "details": []}
+
+    rank_diff = (df["roas_rank"] - df["ideal_rank"]).abs().sum()
+    max_diff = n * (n - 1) / 2  # Maximum possible rank difference
+    if max_diff == 0:
+        score = 100
+    else:
+        score = max(0, 100 - (rank_diff / max_diff * 100))
+
+    if score >= 80:
+        interp = "Excellent — spend aligns well with ROAS"
+    elif score >= 60:
+        interp = "Good — mostly efficient, some room to reallocate"
+    elif score >= 40:
+        interp = "Fair — consider shifting budget to higher-ROAS campaigns"
+    else:
+        interp = "Poor — high spend on low-ROAS campaigns, reallocate urgently"
+
+    # Details: which campaigns are misallocated
+    details = []
+    for _, row in df.iterrows():
+        if row["spend_share"] > 0.15 and row["roas"] < df["roas"].median():
+            details.append(f"**{row['campaign_name']}** gets {row['spend_share']*100:.0f}% of spend but ROAS is below median")
+        elif row["spend_share"] < 0.10 and row["roas"] > df["roas"].median() * 1.5:
+            details.append(f"**{row['campaign_name']}** has strong ROAS ({row['roas']:.2f}x) but only gets {row['spend_share']*100:.0f}% of spend — scale up")
+
+    return {"score": score, "interpretation": interp, "details": details}
+
+
+def creative_fatigue_check(df):
+    """Check for creative fatigue by analyzing frequency vs CTR relationship.
+
+    High frequency + declining CTR = audience seeing ads too often.
+    Returns: list of (campaign_name, frequency, ctr, severity) tuples
+    """
+    if df.empty or "frequency" not in df.columns:
+        return []
+
+    fatigued = []
+    for _, row in df.iterrows():
+        freq = row.get("frequency", 0)
+        ctr = row.get("ctr", 0)
+        name = row.get("campaign_name", row.get("ad_name", "Unknown"))
+
+        if freq >= 5.0:
+            fatigued.append((name, freq, ctr, "critical"))
+        elif freq >= 3.5:
+            fatigued.append((name, freq, ctr, "warning"))
+        elif freq >= 2.5 and ctr < 1.0:
+            fatigued.append((name, freq, ctr, "watch"))
+
+    fatigued.sort(key=lambda x: x[1], reverse=True)
+    return fatigued
+
+
 def top_performers(df, metric="roas", n=10, ascending=False):
     """Return top N rows by a given metric.
 

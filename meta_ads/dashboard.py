@@ -45,6 +45,9 @@ from meta_ads.metrics import (
     format_currency, format_number, format_pct, format_roas,
     period_comparison, funnel_metrics, budget_pacing,
     generate_recommendations, efficiency_quadrant,
+    day_of_week_performance, spend_efficiency_curve,
+    detect_anomalies, spend_allocation_score,
+    creative_fatigue_check,
 )
 
 # Try optional auto-refresh package
@@ -598,10 +601,59 @@ def render_analysis(df, summary, comparison, config):
         st.info("No data to analyze.")
         return
 
-    # ── Optimization Recommendations ──
-    st.subheader("Optimization Recommendations")
     camp_df = campaign_comparison(df)
+
+    # ══════════════════════════════════════════════════════════════
+    # 1. HEALTH SCORE + SPEND ALLOCATION SCORE
+    # ══════════════════════════════════════════════════════════════
+    score_col1, score_col2 = st.columns(2)
+
+    with score_col1:
+        # Account health score: composite of ROAS, CTR, frequency
+        roas_score = min(summary.get("roas", 0) / 3.0 * 100, 100)  # 3x ROAS = 100
+        ctr_score = min(summary.get("avg_ctr", 0) / 2.0 * 100, 100)  # 2% CTR = 100
+        freq_penalty = max(0, (summary.get("avg_frequency", 0) - 3.0) * 20)  # Penalize high freq
+        health = max(0, min(100, (roas_score * 0.5 + ctr_score * 0.3 + 20) - freq_penalty))
+
+        health_color = "#2ca02c" if health >= 70 else "#ff7f0e" if health >= 40 else "#d62728"
+        st.markdown(f"### Account Health Score")
+        st.markdown(
+            f"<div style='text-align:center'>"
+            f"<span style='font-size:64px;font-weight:bold;color:{health_color}'>{health:.0f}</span>"
+            f"<span style='font-size:24px;color:gray'>/100</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Based on ROAS (50%), CTR (30%), and frequency penalty (20%)")
+
+    with score_col2:
+        alloc = spend_allocation_score(camp_df)
+        alloc_score = alloc["score"]
+        alloc_color = "#2ca02c" if alloc_score >= 70 else "#ff7f0e" if alloc_score >= 40 else "#d62728"
+        st.markdown(f"### Spend Allocation Score")
+        st.markdown(
+            f"<div style='text-align:center'>"
+            f"<span style='font-size:64px;font-weight:bold;color:{alloc_color}'>{alloc_score:.0f}</span>"
+            f"<span style='font-size:24px;color:gray'>/100</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(alloc["interpretation"])
+        if alloc["details"]:
+            for detail in alloc["details"][:3]:
+                st.markdown(f"- {detail}")
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # 2. OPTIMIZATION RECOMMENDATIONS
+    # ══════════════════════════════════════════════════════════════
+    st.subheader("Optimization Recommendations")
     recs = generate_recommendations(camp_df, summary)
+
+    # Add creative fatigue warnings
+    fatigue = creative_fatigue_check(df)
+    for name, freq, ctr, severity in fatigue:
+        icon = {"critical": "🔴", "warning": "🟡", "watch": "🟠"}.get(severity, "🟡")
+        recs.append((icon, f"**{name}** — Frequency {freq:.1f} ({severity}). CTR at {ctr:.2f}%. Rotate creatives to combat ad fatigue."))
 
     if recs:
         for icon, msg in recs:
@@ -611,7 +663,9 @@ def render_analysis(df, summary, comparison, config):
 
     st.markdown("---")
 
-    # ── Efficiency Quadrant ──
+    # ══════════════════════════════════════════════════════════════
+    # 3. EFFICIENCY QUADRANT
+    # ══════════════════════════════════════════════════════════════
     if not camp_df.empty and len(camp_df) > 1:
         st.subheader("Campaign Efficiency Quadrant")
         quad_df = efficiency_quadrant(camp_df)
@@ -631,7 +685,6 @@ def render_analysis(df, summary, comparison, config):
             color_discrete_map=color_map,
             labels={"spend": "Spend ($)", "roas": "ROAS", "quadrant": "Quadrant"},
         )
-        # Add quadrant lines
         fig.add_hline(y=quad_df["roas"].median(), line_dash="dash", line_color="gray", opacity=0.5)
         fig.add_vline(x=quad_df["spend"].median(), line_dash="dash", line_color="gray", opacity=0.5)
         fig.update_layout(height=450, margin=dict(t=20, b=40))
@@ -656,7 +709,139 @@ def render_analysis(df, summary, comparison, config):
 
         st.markdown("---")
 
-    # ── Period-over-period deep dive ──
+    # ══════════════════════════════════════════════════════════════
+    # 4. DIMINISHING RETURNS CURVE
+    # ══════════════════════════════════════════════════════════════
+    eff_curve = spend_efficiency_curve(df)
+    if not eff_curve.empty and len(eff_curve) > 1:
+        st.subheader("Spend Efficiency Curve (Diminishing Returns)")
+        st.caption("Campaigns sorted by cost-per-conversion (most efficient first). Shows where additional spend yields fewer conversions.")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=eff_curve["cumulative_spend"],
+            y=eff_curve["cumulative_conversions"],
+            mode="lines+markers",
+            name="Cumulative Conversions",
+            text=eff_curve["campaign_name"],
+            hovertemplate="<b>%{text}</b><br>Cumulative Spend: $%{x:,.0f}<br>Cumulative Conversions: %{y:,.0f}<extra></extra>",
+            line=dict(color="#1f77b4", width=3),
+            marker=dict(size=10),
+        ))
+        # Add marginal CPA as bar chart on secondary axis
+        fig.add_trace(go.Bar(
+            x=eff_curve["cumulative_spend"],
+            y=eff_curve["marginal_cpa"],
+            name="Marginal CPA",
+            text=eff_curve["campaign_name"],
+            hovertemplate="<b>%{text}</b><br>CPA: $%{y:,.2f}<extra></extra>",
+            yaxis="y2",
+            marker_color="rgba(255,127,14,0.5)",
+            width=eff_curve["spend"] * 0.8,
+        ))
+        fig.update_layout(
+            xaxis_title="Cumulative Spend ($)",
+            yaxis=dict(title="Cumulative Conversions"),
+            yaxis2=dict(title="Marginal CPA ($)", overlaying="y", side="right"),
+            legend=dict(x=0, y=1.15, orientation="h"),
+            height=400, margin=dict(t=40, b=40),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # 5. DAY-OF-WEEK PERFORMANCE
+    # ══════════════════════════════════════════════════════════════
+    daily_df = load_insights(
+        config["account_id"], config["date_preset"], "campaign", time_increment=1,
+        since=config["custom_since"], until=config["custom_until"],
+        attribution_windows=config["attr_windows"],
+    )
+    dow_df = day_of_week_performance(daily_df)
+    if not dow_df.empty:
+        st.subheader("Day-of-Week Performance")
+        st.caption("Identify which days convert best to optimize ad scheduling.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=dow_df["day_of_week"], y=dow_df["total_conversions"],
+                name="Conversions", marker_color="#2ca02c",
+            ))
+            fig.add_trace(go.Scatter(
+                x=dow_df["day_of_week"], y=dow_df["cost_per_conversion"],
+                name="Cost/Conv", yaxis="y2",
+                line=dict(color="#d62728", width=2),
+                mode="lines+markers",
+            ))
+            fig.update_layout(
+                yaxis=dict(title="Conversions"),
+                yaxis2=dict(title="Cost/Conversion ($)", overlaying="y", side="right"),
+                legend=dict(x=0, y=1.15, orientation="h"),
+                height=350, margin=dict(t=40, b=40),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=dow_df["day_of_week"], y=dow_df["spend"],
+                name="Spend", marker_color="#1f77b4",
+            ))
+            fig.add_trace(go.Scatter(
+                x=dow_df["day_of_week"], y=dow_df["roas"],
+                name="ROAS", yaxis="y2",
+                line=dict(color="#ff7f0e", width=2),
+                mode="lines+markers",
+            ))
+            fig.update_layout(
+                yaxis=dict(title="Spend ($)"),
+                yaxis2=dict(title="ROAS", overlaying="y", side="right"),
+                legend=dict(x=0, y=1.15, orientation="h"),
+                height=350, margin=dict(t=40, b=40),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Best/worst day callout
+        if len(dow_df) > 1:
+            best_day = dow_df.loc[dow_df["roas"].idxmax()]
+            worst_day = dow_df.loc[dow_df["roas"].idxmin()]
+            bcol, wcol = st.columns(2)
+            bcol.success(f"Best day: **{best_day['day_of_week']}** — {best_day['roas']:.2f}x ROAS, {best_day['total_conversions']:.0f} conversions")
+            wcol.error(f"Worst day: **{worst_day['day_of_week']}** — {worst_day['roas']:.2f}x ROAS, ${worst_day['cost_per_conversion']:,.2f} CPA")
+
+        st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # 6. ANOMALY DETECTION
+    # ══════════════════════════════════════════════════════════════
+    trend_df = daily_trend(daily_df)
+    if not trend_df.empty:
+        spend_anomalies = detect_anomalies(trend_df, "spend", threshold=1.8)
+        conv_anomalies = detect_anomalies(trend_df, "total_conversions", threshold=1.8)
+
+        if not spend_anomalies.empty or not conv_anomalies.empty:
+            st.subheader("Anomaly Detection")
+            st.caption("Days with unusual spend or conversion activity (z-score > 1.8)")
+
+            if not spend_anomalies.empty:
+                for _, row in spend_anomalies.iterrows():
+                    icon = "📈" if row["direction"] == "spike" else "📉"
+                    date_str = row["date_start"].strftime("%b %d") if hasattr(row["date_start"], "strftime") else str(row["date_start"])
+                    st.markdown(f"{icon} **{date_str}** — Spend {'spike' if row['direction'] == 'spike' else 'drop'}: ${row['spend']:,.2f} (z-score: {row['z_score']:+.1f})")
+
+            if not conv_anomalies.empty:
+                for _, row in conv_anomalies.iterrows():
+                    icon = "🎯" if row["direction"] == "spike" else "⚠️"
+                    date_str = row["date_start"].strftime("%b %d") if hasattr(row["date_start"], "strftime") else str(row["date_start"])
+                    st.markdown(f"{icon} **{date_str}** — Conversions {'spike' if row['direction'] == 'spike' else 'drop'}: {row['total_conversions']:,.0f} (z-score: {row['z_score']:+.1f})")
+
+            st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # 7. PERIOD-OVER-PERIOD DEEP DIVE
+    # ══════════════════════════════════════════════════════════════
     if comparison:
         st.subheader("Period-over-Period Analysis")
 
@@ -684,8 +869,11 @@ def render_analysis(df, summary, comparison, config):
 
         comp_df = pd.DataFrame(rows)
         st.dataframe(comp_df, use_container_width=True, hide_index=True)
+        st.markdown("---")
 
-    # ── Top & Bottom performers ──
+    # ══════════════════════════════════════════════════════════════
+    # 8. TOP & BOTTOM PERFORMERS
+    # ══════════════════════════════════════════════════════════════
     if not camp_df.empty:
         st.subheader("Performance Rankings")
         col1, col2 = st.columns(2)
@@ -708,7 +896,9 @@ def render_analysis(df, summary, comparison, config):
             bottom["Conversions"] = bottom["Conversions"].map(lambda x: f"{x:,.0f}")
             st.dataframe(bottom, use_container_width=True, hide_index=True)
 
-    # ── Cost efficiency breakdown ──
+    # ══════════════════════════════════════════════════════════════
+    # 9. COST EFFICIENCY BREAKDOWN
+    # ══════════════════════════════════════════════════════════════
     st.subheader("Cost Efficiency")
     eff_cols = st.columns(4)
     eff_cols[0].metric("Avg CPC", format_currency(summary["avg_cpc"]))
