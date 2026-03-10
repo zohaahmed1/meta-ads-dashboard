@@ -4,6 +4,7 @@ Converts raw API responses into analysis-ready pandas DataFrames.
 """
 
 import pandas as pd
+import numpy as np
 
 
 def _safe_float(value):
@@ -675,6 +676,448 @@ def creative_fatigue_check(df):
 
     fatigued.sort(key=lambda x: x[1], reverse=True)
     return fatigued
+
+
+def trend_forecast(daily_df, days_ahead=7, monthly_budget=None):
+    """Project metrics forward using linear regression on daily data.
+
+    Args:
+        daily_df: DataFrame from daily_trend() with date_start, spend, total_conversions, etc.
+        days_ahead: number of days to project
+        monthly_budget: optional monthly budget for pacing projection
+
+    Returns: dict with forecast DataFrames and summary stats
+    """
+    if daily_df.empty or len(daily_df) < 3:
+        return None
+
+    df = daily_df.sort_values("date_start").copy()
+    df["day_num"] = range(len(df))
+
+    forecasts = {}
+    for metric in ["spend", "total_conversions", "roas"]:
+        if metric not in df.columns:
+            continue
+        y = df[metric].values
+        x = df["day_num"].values
+
+        # Linear regression
+        coeffs = np.polyfit(x, y, 1)
+        slope, intercept = coeffs
+
+        # Project forward
+        future_x = np.arange(len(df), len(df) + days_ahead)
+        future_y = slope * future_x + intercept
+        future_y = np.maximum(future_y, 0)  # No negatives
+
+        last_date = df["date_start"].max()
+        future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=days_ahead)
+
+        forecast_df = pd.DataFrame({
+            "date": future_dates,
+            metric: future_y,
+            "type": "forecast",
+        })
+
+        # Combine actual + forecast for charting
+        actual_df = df[["date_start", metric]].copy()
+        actual_df.columns = ["date", metric]
+        actual_df["type"] = "actual"
+
+        combined = pd.concat([actual_df, forecast_df], ignore_index=True)
+
+        forecasts[metric] = {
+            "combined": combined,
+            "slope": slope,
+            "projected_total": future_y.sum(),
+            "daily_avg_actual": y.mean(),
+            "daily_avg_forecast": future_y.mean(),
+            "trend": "increasing" if slope > 0 else "decreasing" if slope < 0 else "flat",
+        }
+
+    # Monthly pacing projection
+    result = {"metrics": forecasts}
+    if monthly_budget and "spend" in forecasts:
+        total_actual = df["spend"].sum()
+        projected_remaining = forecasts["spend"]["projected_total"]
+        projected_monthly = total_actual + projected_remaining
+        result["budget_pacing"] = {
+            "spent_so_far": total_actual,
+            "projected_remaining": projected_remaining,
+            "projected_monthly_total": projected_monthly,
+            "monthly_budget": monthly_budget,
+            "on_track": projected_monthly <= monthly_budget * 1.1,
+            "pacing_pct": (projected_monthly / monthly_budget * 100) if monthly_budget > 0 else 0,
+        }
+
+    return result
+
+
+def campaign_momentum(df, recent_days=3):
+    """Compare each campaign's recent performance vs full period.
+
+    Flags campaigns that are accelerating (getting better) or decaying
+    (getting worse) over the most recent days.
+
+    Args:
+        df: raw insights DataFrame with date_start and campaign columns
+        recent_days: number of most recent days to compare against full period
+
+    Returns: list of dicts with campaign name, direction, and metric changes
+    """
+    if df.empty or "date_start" not in df.columns or "campaign_name" not in df.columns:
+        return []
+
+    df2 = df.copy()
+    df2["date_start"] = pd.to_datetime(df2["date_start"])
+    max_date = df2["date_start"].max()
+    cutoff = max_date - pd.Timedelta(days=recent_days)
+
+    results = []
+    for name, group in df2.groupby("campaign_name"):
+        full = group
+        recent = group[group["date_start"] > cutoff]
+
+        if full.empty or recent.empty or len(full) < recent_days + 1:
+            continue
+
+        full_days = (full["date_start"].max() - full["date_start"].min()).days + 1
+        if full_days == 0:
+            continue
+
+        # Daily averages for full period vs recent
+        full_daily_spend = full["spend"].sum() / full_days
+        recent_daily_spend = recent["spend"].sum() / recent_days if recent_days > 0 else 0
+
+        full_daily_conv = full["total_conversions"].sum() / full_days
+        recent_daily_conv = recent["total_conversions"].sum() / recent_days if recent_days > 0 else 0
+
+        full_ctr = (full["clicks"].sum() / full["impressions"].sum() * 100) if full["impressions"].sum() > 0 else 0
+        recent_ctr = (recent["clicks"].sum() / recent["impressions"].sum() * 100) if recent["impressions"].sum() > 0 else 0
+
+        full_cpa = (full["spend"].sum() / full["total_conversions"].sum()) if full["total_conversions"].sum() > 0 else 0
+        recent_cpa = (recent["spend"].sum() / recent["total_conversions"].sum()) if recent["total_conversions"].sum() > 0 else 0
+
+        # Calculate momentum signals
+        conv_change = ((recent_daily_conv - full_daily_conv) / full_daily_conv * 100) if full_daily_conv > 0 else 0
+        ctr_change = ((recent_ctr - full_ctr) / full_ctr * 100) if full_ctr > 0 else 0
+        cpa_change = ((recent_cpa - full_cpa) / full_cpa * 100) if full_cpa > 0 else 0
+
+        # Overall direction: weighted score of conversion growth and efficiency
+        # Positive = accelerating, negative = decaying
+        score = conv_change * 0.5 + ctr_change * 0.3 - cpa_change * 0.2
+
+        if score > 15:
+            direction = "accelerating"
+            icon = "🚀"
+        elif score > 5:
+            direction = "improving"
+            icon = "📈"
+        elif score < -15:
+            direction = "decaying"
+            icon = "🔻"
+        elif score < -5:
+            direction = "slowing"
+            icon = "📉"
+        else:
+            direction = "stable"
+            icon = "➡️"
+
+        results.append({
+            "campaign_name": name,
+            "direction": direction,
+            "icon": icon,
+            "score": score,
+            "conv_change_pct": conv_change,
+            "ctr_change_pct": ctr_change,
+            "cpa_change_pct": cpa_change,
+            "recent_daily_conv": recent_daily_conv,
+            "full_daily_conv": full_daily_conv,
+            "recent_cpa": recent_cpa,
+            "full_cpa": full_cpa,
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+
+def budget_reallocation_impact(camp_df, reallocations):
+    """Simulate the impact of reallocating budget between campaigns.
+
+    Args:
+        camp_df: DataFrame from campaign_comparison()
+        reallocations: dict of {campaign_name: new_spend_pct} (0-100)
+            Must sum to ~100
+
+    Returns: dict with projected metrics under new allocation
+    """
+    if camp_df.empty:
+        return {}
+
+    total_spend = camp_df["spend"].sum()
+    total_conversions = camp_df["total_conversions"].sum()
+    total_value = camp_df["conversion_value"].sum()
+
+    projected = []
+    for _, row in camp_df.iterrows():
+        name = row["campaign_name"]
+        current_spend = row["spend"]
+        current_conv = row["total_conversions"]
+        current_value = row["conversion_value"]
+
+        new_pct = reallocations.get(name, (current_spend / total_spend * 100) if total_spend > 0 else 0)
+        new_spend = total_spend * new_pct / 100
+
+        # Estimate new conversions using diminishing returns model
+        # Assume efficiency decreases as spend increases beyond current level
+        if current_spend > 0 and current_conv > 0:
+            efficiency = current_conv / current_spend
+            spend_ratio = new_spend / current_spend
+            # Diminishing returns: sqrt scaling for increases, linear for decreases
+            if spend_ratio > 1:
+                adj_ratio = 1 + (spend_ratio - 1) ** 0.7
+            else:
+                adj_ratio = spend_ratio
+            new_conv = efficiency * current_spend * adj_ratio
+            value_per_conv = current_value / current_conv if current_conv > 0 else 0
+            new_value = new_conv * value_per_conv
+        else:
+            new_conv = 0
+            new_value = 0
+
+        projected.append({
+            "campaign_name": name,
+            "current_spend": current_spend,
+            "new_spend": new_spend,
+            "spend_change": new_spend - current_spend,
+            "current_conversions": current_conv,
+            "projected_conversions": new_conv,
+            "conv_change": new_conv - current_conv,
+            "current_roas": row["roas"],
+            "projected_roas": new_value / new_spend if new_spend > 0 else 0,
+        })
+
+    proj_df = pd.DataFrame(projected)
+    return {
+        "campaigns": proj_df,
+        "total_current_conv": total_conversions,
+        "total_projected_conv": proj_df["projected_conversions"].sum(),
+        "total_current_roas": total_value / total_spend if total_spend > 0 else 0,
+        "total_projected_roas": proj_df.apply(
+            lambda r: r["new_spend"] * r["projected_roas"], axis=1
+        ).sum() / total_spend if total_spend > 0 else 0,
+        "conv_change_pct": ((proj_df["projected_conversions"].sum() - total_conversions) / total_conversions * 100) if total_conversions > 0 else 0,
+    }
+
+
+def executive_summary(summary, camp_df, comparison=None, client_context=None, fatigue=None, momentum=None):
+    """Generate a plain-English executive summary of account performance.
+
+    Returns: string with 3-5 sentences summarizing the account state
+    """
+    ctx = client_context or {}
+    client_name = ctx.get("name", "The account")
+
+    parts = []
+
+    # Opening: overall state
+    spend = summary.get("total_spend", 0)
+    roas = summary.get("roas", 0)
+    convs = summary.get("total_conversions", 0)
+    cpa = summary.get("cost_per_conversion", 0)
+
+    parts.append(
+        f"{client_name} spent ${spend:,.2f} and generated "
+        f"{convs:,.0f} conversion{'s' if convs != 1 else ''} "
+        f"at a {roas:.2f}x ROAS"
+        f"{f' (${cpa:,.2f} CPA)' if cpa > 0 else ''}."
+    )
+
+    # Period comparison
+    if comparison:
+        spend_chg = comparison.get("total_spend", {}).get("change_pct", 0)
+        conv_chg = comparison.get("total_conversions", {}).get("change_pct", 0)
+        roas_chg = comparison.get("roas", {}).get("change_pct", 0)
+
+        if abs(conv_chg) > 5 or abs(roas_chg) > 5:
+            direction = "up" if conv_chg > 0 else "down"
+            parts.append(
+                f"Compared to the previous period, conversions are {direction} "
+                f"{abs(conv_chg):.0f}% and ROAS {'improved' if roas_chg > 0 else 'declined'} "
+                f"{abs(roas_chg):.0f}%."
+            )
+
+    # Target comparison
+    target_roas = ctx.get("target_roas")
+    target_cpa = ctx.get("target_cpa")
+    if target_roas:
+        if roas >= target_roas:
+            parts.append(f"ROAS is above the {target_roas:.1f}x target — there's room to scale.")
+        else:
+            gap = ((target_roas - roas) / target_roas * 100)
+            parts.append(f"ROAS is {gap:.0f}% below the {target_roas:.1f}x target — optimization is needed.")
+    if target_cpa and cpa > 0:
+        if cpa <= target_cpa:
+            parts.append(f"CPA of ${cpa:,.2f} is within the ${target_cpa:,.2f} target.")
+        else:
+            parts.append(f"CPA of ${cpa:,.2f} exceeds the ${target_cpa:,.2f} target by {((cpa - target_cpa) / target_cpa * 100):.0f}%.")
+
+    # Winners and losers
+    if not camp_df.empty and len(camp_df) > 1:
+        best = camp_df.nlargest(1, "roas").iloc[0]
+        worst = camp_df.nsmallest(1, "roas").iloc[0]
+        parts.append(
+            f"Top performer is \"{best['campaign_name']}\" "
+            f"({best['roas']:.2f}x ROAS), while \"{worst['campaign_name']}\" "
+            f"is the weakest ({worst['roas']:.2f}x)."
+        )
+
+    # Momentum
+    if momentum:
+        accel = [m for m in momentum if m["direction"] in ("accelerating", "improving")]
+        decay = [m for m in momentum if m["direction"] in ("decaying", "slowing")]
+        if accel:
+            names = ", ".join(f'"{m["campaign_name"]}"' for m in accel[:2])
+            parts.append(f"{names} {'is' if len(accel) == 1 else 'are'} trending upward over the last 3 days.")
+        if decay:
+            names = ", ".join(f'"{m["campaign_name"]}"' for m in decay[:2])
+            parts.append(f"Watch {names} — performance is declining recently.")
+
+    # Creative fatigue
+    if fatigue:
+        critical = [f for f in fatigue if f[3] == "critical"]
+        if critical:
+            parts.append(f"{len(critical)} campaign{'s' if len(critical) > 1 else ''} {'show' if len(critical) > 1 else 'shows'} creative fatigue (frequency 5+). Rotate creatives soon.")
+
+    # Top action
+    if roas < 1.0:
+        parts.append("Priority action: cut losing campaigns immediately — the account is spending more than it earns.")
+    elif not camp_df.empty:
+        dogs = camp_df[camp_df["roas"] < camp_df["roas"].median() * 0.5]
+        stars = camp_df[camp_df["roas"] > camp_df["roas"].median() * 1.5]
+        if not dogs.empty and not stars.empty:
+            parts.append(f"Priority action: shift budget from underperformers to top campaigns to improve overall efficiency.")
+
+    return " ".join(parts)
+
+
+def hourly_performance(df):
+    """Aggregate metrics by hour of day from hourly breakdown data.
+
+    Expects df to have an 'hourly_stats_aggregated_by_advertiser_time_zone'
+    column, or to have been fetched with that breakdown.
+
+    Returns: DataFrame with hour (0-23) and aggregated metrics
+    """
+    hour_col = "hourly_stats_aggregated_by_advertiser_time_zone"
+    if df.empty or hour_col not in df.columns:
+        return pd.DataFrame()
+
+    df2 = df.copy()
+    # Meta returns hour ranges like "00:00:00 - 00:59:59"
+    # Extract the starting hour
+    df2["hour"] = df2[hour_col].apply(
+        lambda x: int(str(x).split(":")[0]) if pd.notna(x) else -1
+    )
+    df2 = df2[df2["hour"] >= 0]
+
+    grouped = df2.groupby("hour").agg({
+        "spend": "sum",
+        "impressions": "sum",
+        "clicks": "sum",
+        "total_conversions": "sum",
+        "conversion_value": "sum",
+    }).reset_index()
+
+    grouped["ctr"] = (grouped["clicks"] / grouped["impressions"] * 100).fillna(0)
+    grouped["cpc"] = (grouped["spend"] / grouped["clicks"]).fillna(0)
+    grouped["cost_per_conversion"] = (grouped["spend"] / grouped["total_conversions"]).fillna(0)
+    grouped["roas"] = (grouped["conversion_value"] / grouped["spend"]).fillna(0)
+
+    return grouped.sort_values("hour")
+
+
+def audience_saturation(daily_df):
+    """Track audience saturation by analyzing frequency and CTR trends over time.
+
+    Rising frequency + falling CTR = audience exhaustion.
+
+    Args:
+        daily_df: raw insights DataFrame with date_start, frequency, ctr
+
+    Returns: dict with saturation data and alerts
+    """
+    if daily_df.empty or "date_start" not in daily_df.columns:
+        return None
+
+    df = daily_df.copy()
+    df["date_start"] = pd.to_datetime(df["date_start"])
+
+    # Aggregate by date
+    daily = df.groupby("date_start").agg({
+        "impressions": "sum",
+        "reach": "sum",
+        "clicks": "sum",
+        "spend": "sum",
+    }).reset_index()
+
+    daily = daily.sort_values("date_start")
+    daily["frequency"] = (daily["impressions"] / daily["reach"]).fillna(0)
+    daily["ctr"] = (daily["clicks"] / daily["impressions"] * 100).fillna(0)
+
+    if len(daily) < 5:
+        return None
+
+    # Calculate rolling averages for smoothing
+    daily["freq_ma"] = daily["frequency"].rolling(3, min_periods=1).mean()
+    daily["ctr_ma"] = daily["ctr"].rolling(3, min_periods=1).mean()
+
+    # Trend analysis: compare first half vs second half
+    mid = len(daily) // 2
+    first_half = daily.iloc[:mid]
+    second_half = daily.iloc[mid:]
+
+    avg_freq_first = first_half["frequency"].mean()
+    avg_freq_second = second_half["frequency"].mean()
+    avg_ctr_first = first_half["ctr"].mean()
+    avg_ctr_second = second_half["ctr"].mean()
+
+    freq_trend = ((avg_freq_second - avg_freq_first) / avg_freq_first * 100) if avg_freq_first > 0 else 0
+    ctr_trend = ((avg_ctr_second - avg_ctr_first) / avg_ctr_first * 100) if avg_ctr_first > 0 else 0
+
+    # Saturation score: high freq growth + CTR decline = saturation
+    if freq_trend > 0 and ctr_trend < 0:
+        saturation_score = min(100, abs(freq_trend) + abs(ctr_trend))
+        if saturation_score > 50:
+            severity = "critical"
+            message = "Audience is heavily saturated — frequency rising sharply while CTR drops. Expand audiences or rotate creatives immediately."
+        elif saturation_score > 25:
+            severity = "warning"
+            message = "Audience showing saturation signals — frequency increasing while engagement declines. Consider refreshing creatives."
+        else:
+            severity = "watch"
+            message = "Early saturation signals detected. Monitor frequency and CTR trends."
+    elif freq_trend > 20:
+        saturation_score = min(50, freq_trend)
+        severity = "watch"
+        message = "Frequency is rising but CTR is holding. Watch for engagement drops."
+    else:
+        saturation_score = 0
+        severity = "healthy"
+        message = "No saturation signals. Audience engagement is stable."
+
+    return {
+        "daily": daily[["date_start", "frequency", "ctr", "freq_ma", "ctr_ma"]],
+        "freq_trend_pct": freq_trend,
+        "ctr_trend_pct": ctr_trend,
+        "saturation_score": saturation_score,
+        "severity": severity,
+        "message": message,
+        "avg_freq_first_half": avg_freq_first,
+        "avg_freq_second_half": avg_freq_second,
+        "avg_ctr_first_half": avg_ctr_first,
+        "avg_ctr_second_half": avg_ctr_second,
+    }
 
 
 def top_performers(df, metric="roas", n=10, ascending=False):

@@ -89,6 +89,7 @@ VALID_DATE_PRESETS = [
 VALID_BREAKDOWNS = [
     "age", "gender", "country", "placement",
     "device_platform", "publisher_platform",
+    "hourly_stats_aggregated_by_advertiser_time_zone",
 ]
 
 VALID_LEVELS = ["campaign", "adset", "ad"]

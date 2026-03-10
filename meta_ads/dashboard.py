@@ -48,6 +48,8 @@ from meta_ads.metrics import (
     day_of_week_performance, spend_efficiency_curve,
     detect_anomalies, spend_allocation_score,
     creative_fatigue_check,
+    trend_forecast, campaign_momentum, budget_reallocation_impact,
+    executive_summary, hourly_performance, audience_saturation,
 )
 
 # Try optional auto-refresh package
@@ -659,8 +661,34 @@ def render_analysis(df, summary, comparison, config):
     camp_df = campaign_comparison(df)
     ctx = config.get("client_context", {})
 
+    # Precompute shared data used across multiple sections
+    daily_df = load_insights(
+        config["account_id"], config["date_preset"], "campaign", time_increment=1,
+        since=config["custom_since"], until=config["custom_until"],
+        attribution_windows=config["attr_windows"],
+    )
+    trend_df = daily_trend(daily_df)
+    fatigue = creative_fatigue_check(df)
+    mom = campaign_momentum(df)
+
     # ══════════════════════════════════════════════════════════════
-    # 0. CLIENT CONTEXT BANNER
+    # 0. EXECUTIVE SUMMARY
+    # ══════════════════════════════════════════════════════════════
+    st.subheader("Executive Summary")
+    summary_text = executive_summary(summary, camp_df, comparison, ctx, fatigue, mom)
+    st.markdown(
+        f"<div style='background:#f8f9fa;border-left:4px solid #1f77b4;"
+        f"padding:16px 20px;border-radius:4px;font-size:15px;line-height:1.6'>"
+        f"{summary_text}</div>",
+        unsafe_allow_html=True,
+    )
+    # Copy button
+    st.code(summary_text, language=None)
+    st.caption("Copy the text above for client reports or Slack updates.")
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # 1. CLIENT CONTEXT BANNER
     # ══════════════════════════════════════════════════════════════
     has_context = any([ctx.get("name"), ctx.get("goal"), ctx.get("target_cpa"),
                        ctx.get("target_roas"), ctx.get("monthly_budget")])
@@ -686,20 +714,16 @@ def render_analysis(df, summary, comparison, config):
         st.caption("Tip: Add client context in the sidebar to get tailored recommendations with target-based alerts.")
 
     # ══════════════════════════════════════════════════════════════
-    # 1. HEALTH SCORE + SPEND ALLOCATION SCORE
+    # 2. HEALTH SCORE + SPEND ALLOCATION SCORE
     # ══════════════════════════════════════════════════════════════
     score_col1, score_col2 = st.columns(2)
 
     with score_col1:
-        # Account health score: composite of ROAS, CTR, frequency
-        # If client targets are set, score against those instead of generic benchmarks
         roas_benchmark = ctx.get("target_roas") or 3.0
         roas_score = min(summary.get("roas", 0) / roas_benchmark * 100, 100)
-
-        ctr_score = min(summary.get("avg_ctr", 0) / 2.0 * 100, 100)  # 2% CTR = 100
+        ctr_score = min(summary.get("avg_ctr", 0) / 2.0 * 100, 100)
         freq_penalty = max(0, (summary.get("avg_frequency", 0) - 3.0) * 20)
 
-        # CPA score if target set
         cpa_score = 0
         if ctx.get("target_cpa") and summary.get("cost_per_conversion", 0) > 0:
             cpa_ratio = ctx["target_cpa"] / summary["cost_per_conversion"]
@@ -739,13 +763,39 @@ def render_analysis(df, summary, comparison, config):
     st.markdown("---")
 
     # ══════════════════════════════════════════════════════════════
-    # 2. OPTIMIZATION RECOMMENDATIONS
+    # 3. CAMPAIGN MOMENTUM
+    # ══════════════════════════════════════════════════════════════
+    if mom:
+        st.subheader("Campaign Momentum (Last 3 Days vs Full Period)")
+        st.caption("Detects which campaigns are accelerating or losing steam based on recent performance trends.")
+
+        mom_cols = st.columns(min(len(mom), 4))
+        for i, m in enumerate(mom[:8]):  # Show top 8
+            col_idx = i % min(len(mom), 4)
+            with mom_cols[col_idx]:
+                direction_color = {
+                    "accelerating": "#2ca02c", "improving": "#8bc34a",
+                    "stable": "#9e9e9e",
+                    "slowing": "#ff9800", "decaying": "#d62728",
+                }
+                color = direction_color.get(m["direction"], "#9e9e9e")
+                st.markdown(
+                    f"<div style='border-left:4px solid {color};padding:8px 12px;margin-bottom:8px'>"
+                    f"<b>{m['icon']} {m['campaign_name']}</b><br>"
+                    f"<span style='color:{color};font-weight:bold'>{m['direction'].title()}</span><br>"
+                    f"<small>Conversions: {m['conv_change_pct']:+.0f}% | CTR: {m['ctr_change_pct']:+.0f}% | CPA: {m['cpa_change_pct']:+.0f}%</small>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # 4. OPTIMIZATION RECOMMENDATIONS
     # ══════════════════════════════════════════════════════════════
     st.subheader("Optimization Recommendations")
     recs = generate_recommendations(camp_df, summary, client_context=ctx)
 
-    # Add creative fatigue warnings
-    fatigue = creative_fatigue_check(df)
     for name, freq, ctr, severity in fatigue:
         icon = {"critical": "🔴", "warning": "🟡", "watch": "🟠"}.get(severity, "🟡")
         recs.append((icon, f"**{name}** — Frequency {freq:.1f} ({severity}). CTR at {ctr:.2f}%. Rotate creatives to combat ad fatigue."))
@@ -759,7 +809,161 @@ def render_analysis(df, summary, comparison, config):
     st.markdown("---")
 
     # ══════════════════════════════════════════════════════════════
-    # 3. EFFICIENCY QUADRANT
+    # 5. TREND FORECASTING
+    # ══════════════════════════════════════════════════════════════
+    if not trend_df.empty and len(trend_df) >= 3:
+        forecast = trend_forecast(trend_df, days_ahead=7, monthly_budget=ctx.get("monthly_budget"))
+        if forecast:
+            st.subheader("7-Day Trend Forecast")
+            st.caption("Linear projection based on recent daily trends. Use as directional guidance, not exact predictions.")
+
+            fc_col1, fc_col2 = st.columns(2)
+
+            # Spend forecast chart
+            if "spend" in forecast["metrics"]:
+                spend_fc = forecast["metrics"]["spend"]
+                with fc_col1:
+                    combined = spend_fc["combined"]
+                    fig = go.Figure()
+                    actual = combined[combined["type"] == "actual"]
+                    proj = combined[combined["type"] == "forecast"]
+                    fig.add_trace(go.Scatter(
+                        x=actual["date"], y=actual["spend"],
+                        mode="lines+markers", name="Actual",
+                        line=dict(color="#1f77b4", width=2),
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=proj["date"], y=proj["spend"],
+                        mode="lines+markers", name="Forecast",
+                        line=dict(color="#1f77b4", width=2, dash="dash"),
+                        marker=dict(symbol="diamond"),
+                    ))
+                    fig.update_layout(
+                        title="Spend Forecast", height=350,
+                        margin=dict(t=40, b=40),
+                        yaxis_title="Spend ($)",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    trend_icon = "📈" if spend_fc["trend"] == "increasing" else "📉" if spend_fc["trend"] == "decreasing" else "➡️"
+                    st.caption(f"{trend_icon} Trend: {spend_fc['trend']} — Daily avg: ${spend_fc['daily_avg_actual']:,.2f} actual → ${spend_fc['daily_avg_forecast']:,.2f} projected")
+
+            # Conversions forecast chart
+            if "total_conversions" in forecast["metrics"]:
+                conv_fc = forecast["metrics"]["total_conversions"]
+                with fc_col2:
+                    combined = conv_fc["combined"]
+                    fig = go.Figure()
+                    actual = combined[combined["type"] == "actual"]
+                    proj = combined[combined["type"] == "forecast"]
+                    fig.add_trace(go.Scatter(
+                        x=actual["date"], y=actual["total_conversions"],
+                        mode="lines+markers", name="Actual",
+                        line=dict(color="#2ca02c", width=2),
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=proj["date"], y=proj["total_conversions"],
+                        mode="lines+markers", name="Forecast",
+                        line=dict(color="#2ca02c", width=2, dash="dash"),
+                        marker=dict(symbol="diamond"),
+                    ))
+                    fig.update_layout(
+                        title="Conversions Forecast", height=350,
+                        margin=dict(t=40, b=40),
+                        yaxis_title="Conversions",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    trend_icon = "📈" if conv_fc["trend"] == "increasing" else "📉" if conv_fc["trend"] == "decreasing" else "➡️"
+                    st.caption(f"{trend_icon} Trend: {conv_fc['trend']} — Daily avg: {conv_fc['daily_avg_actual']:,.1f} actual → {conv_fc['daily_avg_forecast']:,.1f} projected")
+
+            # Budget pacing projection
+            if "budget_pacing" in forecast:
+                bp = forecast["budget_pacing"]
+                pacing_color = "#2ca02c" if bp["on_track"] else "#d62728"
+                st.markdown(
+                    f"**Monthly Budget Pacing:** "
+                    f"${bp['spent_so_far']:,.0f} spent so far + "
+                    f"${bp['projected_remaining']:,.0f} projected = "
+                    f"<span style='color:{pacing_color};font-weight:bold'>"
+                    f"${bp['projected_monthly_total']:,.0f}</span> "
+                    f"({bp['pacing_pct']:.0f}% of ${bp['monthly_budget']:,.0f} budget) — "
+                    f"{'On track' if bp['on_track'] else 'Over budget'}",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # 6. BUDGET REALLOCATION SIMULATOR
+    # ══════════════════════════════════════════════════════════════
+    if not camp_df.empty and len(camp_df) > 1:
+        st.subheader("Budget Reallocation Simulator")
+        st.caption("Adjust spend allocation with sliders to see projected impact on conversions and ROAS. Uses diminishing returns modeling.")
+
+        total_spend = camp_df["spend"].sum()
+        reallocations = {}
+        slider_cols = st.columns(min(len(camp_df), 3))
+
+        for i, (_, row) in enumerate(camp_df.iterrows()):
+            col_idx = i % min(len(camp_df), 3)
+            current_pct = (row["spend"] / total_spend * 100) if total_spend > 0 else 0
+            with slider_cols[col_idx]:
+                # Truncate long campaign names for the slider label
+                label = row["campaign_name"][:30] + "..." if len(row["campaign_name"]) > 30 else row["campaign_name"]
+                new_pct = st.slider(
+                    label,
+                    min_value=0, max_value=100,
+                    value=int(round(current_pct)),
+                    key=f"realloc_{config['account_id']}_{row['campaign_name']}",
+                    help=f"Current: {current_pct:.0f}% (${row['spend']:,.0f})",
+                )
+                reallocations[row["campaign_name"]] = new_pct
+
+        # Show projected impact
+        alloc_total = sum(reallocations.values())
+        if alloc_total > 0:
+            # Normalize to 100%
+            normalized = {k: v / alloc_total * 100 for k, v in reallocations.items()}
+            impact = budget_reallocation_impact(camp_df, normalized)
+
+            if impact:
+                imp_col1, imp_col2, imp_col3 = st.columns(3)
+                conv_change = impact.get("conv_change_pct", 0)
+                conv_color = "#2ca02c" if conv_change > 0 else "#d62728" if conv_change < 0 else "#9e9e9e"
+                imp_col1.metric(
+                    "Projected Conversions",
+                    f"{impact['total_projected_conv']:,.0f}",
+                    f"{conv_change:+.1f}% vs current",
+                )
+                imp_col2.metric(
+                    "Current Conversions",
+                    f"{impact['total_current_conv']:,.0f}",
+                )
+                imp_col3.metric(
+                    "Projected ROAS",
+                    f"{impact['total_projected_roas']:.2f}x",
+                    f"vs {impact['total_current_roas']:.2f}x current",
+                )
+
+                # Campaign-level breakdown
+                if "campaigns" in impact:
+                    proj_df = impact["campaigns"][["campaign_name", "current_spend", "new_spend",
+                                                    "current_conversions", "projected_conversions",
+                                                    "current_roas", "projected_roas"]].copy()
+                    proj_df.columns = ["Campaign", "Current $", "New $", "Current Conv", "Proj Conv", "Current ROAS", "Proj ROAS"]
+                    proj_df["Current $"] = proj_df["Current $"].map(lambda x: f"${x:,.0f}")
+                    proj_df["New $"] = proj_df["New $"].map(lambda x: f"${x:,.0f}")
+                    proj_df["Current Conv"] = proj_df["Current Conv"].map(lambda x: f"{x:,.0f}")
+                    proj_df["Proj Conv"] = proj_df["Proj Conv"].map(lambda x: f"{x:,.0f}")
+                    proj_df["Current ROAS"] = proj_df["Current ROAS"].map(lambda x: f"{x:.2f}x")
+                    proj_df["Proj ROAS"] = proj_df["Proj ROAS"].map(lambda x: f"{x:.2f}x")
+
+                    with st.expander("Campaign-level projection details"):
+                        st.dataframe(proj_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # 7. EFFICIENCY QUADRANT
     # ══════════════════════════════════════════════════════════════
     if not camp_df.empty and len(camp_df) > 1:
         st.subheader("Campaign Efficiency Quadrant")
@@ -805,7 +1009,7 @@ def render_analysis(df, summary, comparison, config):
         st.markdown("---")
 
     # ══════════════════════════════════════════════════════════════
-    # 4. DIMINISHING RETURNS CURVE
+    # 8. DIMINISHING RETURNS CURVE
     # ══════════════════════════════════════════════════════════════
     eff_curve = spend_efficiency_curve(df)
     if not eff_curve.empty and len(eff_curve) > 1:
@@ -823,7 +1027,6 @@ def render_analysis(df, summary, comparison, config):
             line=dict(color="#1f77b4", width=3),
             marker=dict(size=10),
         ))
-        # Add marginal CPA as bar chart on secondary axis
         fig.add_trace(go.Bar(
             x=eff_curve["cumulative_spend"],
             y=eff_curve["marginal_cpa"],
@@ -845,13 +1048,8 @@ def render_analysis(df, summary, comparison, config):
         st.markdown("---")
 
     # ══════════════════════════════════════════════════════════════
-    # 5. DAY-OF-WEEK PERFORMANCE
+    # 9. DAY-OF-WEEK PERFORMANCE
     # ══════════════════════════════════════════════════════════════
-    daily_df = load_insights(
-        config["account_id"], config["date_preset"], "campaign", time_increment=1,
-        since=config["custom_since"], until=config["custom_until"],
-        attribution_windows=config["attr_windows"],
-    )
     dow_df = day_of_week_performance(daily_df)
     if not dow_df.empty:
         st.subheader("Day-of-Week Performance")
@@ -898,7 +1096,6 @@ def render_analysis(df, summary, comparison, config):
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        # Best/worst day callout
         if len(dow_df) > 1:
             best_day = dow_df.loc[dow_df["roas"].idxmax()]
             worst_day = dow_df.loc[dow_df["roas"].idxmin()]
@@ -909,9 +1106,125 @@ def render_analysis(df, summary, comparison, config):
         st.markdown("---")
 
     # ══════════════════════════════════════════════════════════════
-    # 6. ANOMALY DETECTION
+    # 10. HOUR-OF-DAY HEATMAP
     # ══════════════════════════════════════════════════════════════
-    trend_df = daily_trend(daily_df)
+    try:
+        hourly_raw = load_insights_with_breakdown(
+            config["account_id"], config["date_preset"], "campaign",
+            breakdown="hourly_stats_aggregated_by_advertiser_time_zone",
+            since=config["custom_since"], until=config["custom_until"],
+            attribution_windows=config["attr_windows"],
+        )
+        hourly_df = hourly_performance(hourly_raw)
+        if not hourly_df.empty:
+            st.subheader("Hour-of-Day Performance")
+            st.caption("Heatmap showing when your ads convert best. Use this to optimize ad scheduling rules.")
+
+            h_col1, h_col2 = st.columns(2)
+            with h_col1:
+                # Conversions heatmap
+                fig = go.Figure(data=go.Bar(
+                    x=hourly_df["hour"],
+                    y=hourly_df["total_conversions"],
+                    marker_color=hourly_df["total_conversions"],
+                    marker_colorscale="Greens",
+                    text=hourly_df["total_conversions"].map(lambda x: f"{x:,.0f}"),
+                    textposition="auto",
+                ))
+                fig.update_layout(
+                    title="Conversions by Hour",
+                    xaxis=dict(title="Hour of Day", dtick=2),
+                    yaxis_title="Conversions",
+                    height=350, margin=dict(t=40, b=40),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            with h_col2:
+                # CPA by hour
+                fig = go.Figure(data=go.Bar(
+                    x=hourly_df["hour"],
+                    y=hourly_df["cost_per_conversion"],
+                    marker_color=hourly_df["cost_per_conversion"],
+                    marker_colorscale="Reds_r",  # Lower CPA = greener
+                    text=hourly_df["cost_per_conversion"].map(lambda x: f"${x:,.2f}"),
+                    textposition="auto",
+                ))
+                fig.update_layout(
+                    title="CPA by Hour",
+                    xaxis=dict(title="Hour of Day", dtick=2),
+                    yaxis_title="Cost per Conversion ($)",
+                    height=350, margin=dict(t=40, b=40),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Best/worst hours
+            if len(hourly_df) > 2:
+                best_hour = hourly_df.loc[hourly_df["total_conversions"].idxmax()]
+                worst_cpa_hour = hourly_df[hourly_df["total_conversions"] > 0]
+                if not worst_cpa_hour.empty:
+                    worst_h = worst_cpa_hour.loc[worst_cpa_hour["cost_per_conversion"].idxmax()]
+                    hcol1, hcol2 = st.columns(2)
+                    hcol1.success(f"Peak hour: **{int(best_hour['hour']):02d}:00** — {best_hour['total_conversions']:,.0f} conversions")
+                    hcol2.error(f"Least efficient: **{int(worst_h['hour']):02d}:00** — ${worst_h['cost_per_conversion']:,.2f} CPA")
+
+            st.markdown("---")
+    except Exception:
+        pass  # Hourly breakdown may not be available for all accounts
+
+    # ══════════════════════════════════════════════════════════════
+    # 11. AUDIENCE SATURATION TRACKER
+    # ══════════════════════════════════════════════════════════════
+    sat = audience_saturation(daily_df)
+    if sat and sat.get("daily") is not None and not sat["daily"].empty:
+        st.subheader("Audience Saturation Tracker")
+        severity_colors = {"critical": "#d62728", "warning": "#ff9800", "watch": "#ffc107", "healthy": "#2ca02c"}
+        sev_color = severity_colors.get(sat["severity"], "#9e9e9e")
+
+        st.markdown(
+            f"<div style='border-left:4px solid {sev_color};padding:12px 16px;background:#f8f9fa;border-radius:4px'>"
+            f"<b style='color:{sev_color}'>{sat['severity'].upper()}</b> — {sat['message']}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        sat_df = sat["daily"]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=sat_df["date_start"], y=sat_df["freq_ma"],
+            name="Frequency (3-day avg)", mode="lines",
+            line=dict(color="#d62728", width=2),
+        ))
+        fig.add_trace(go.Scatter(
+            x=sat_df["date_start"], y=sat_df["ctr_ma"],
+            name="CTR % (3-day avg)", mode="lines",
+            line=dict(color="#1f77b4", width=2),
+            yaxis="y2",
+        ))
+        fig.update_layout(
+            yaxis=dict(title="Frequency", side="left"),
+            yaxis2=dict(title="CTR (%)", overlaying="y", side="right"),
+            legend=dict(x=0, y=1.15, orientation="h"),
+            height=350, margin=dict(t=40, b=40),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        sat_c1, sat_c2 = st.columns(2)
+        sat_c1.metric(
+            "Frequency Trend",
+            f"{sat['avg_freq_second_half']:.2f}",
+            f"{sat['freq_trend_pct']:+.1f}% vs first half ({sat['avg_freq_first_half']:.2f})",
+        )
+        sat_c2.metric(
+            "CTR Trend",
+            f"{sat['avg_ctr_second_half']:.2f}%",
+            f"{sat['ctr_trend_pct']:+.1f}% vs first half ({sat['avg_ctr_first_half']:.2f}%)",
+        )
+
+        st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # 12. ANOMALY DETECTION
+    # ══════════════════════════════════════════════════════════════
     if not trend_df.empty:
         spend_anomalies = detect_anomalies(trend_df, "spend", threshold=1.8)
         conv_anomalies = detect_anomalies(trend_df, "total_conversions", threshold=1.8)
@@ -935,7 +1248,7 @@ def render_analysis(df, summary, comparison, config):
             st.markdown("---")
 
     # ══════════════════════════════════════════════════════════════
-    # 7. PERIOD-OVER-PERIOD DEEP DIVE
+    # 13. PERIOD-OVER-PERIOD DEEP DIVE
     # ══════════════════════════════════════════════════════════════
     if comparison:
         st.subheader("Period-over-Period Analysis")
@@ -967,7 +1280,7 @@ def render_analysis(df, summary, comparison, config):
         st.markdown("---")
 
     # ══════════════════════════════════════════════════════════════
-    # 8. TOP & BOTTOM PERFORMERS
+    # 14. TOP & BOTTOM PERFORMERS
     # ══════════════════════════════════════════════════════════════
     if not camp_df.empty:
         st.subheader("Performance Rankings")
@@ -992,7 +1305,7 @@ def render_analysis(df, summary, comparison, config):
             st.dataframe(bottom, use_container_width=True, hide_index=True)
 
     # ══════════════════════════════════════════════════════════════
-    # 9. COST EFFICIENCY BREAKDOWN
+    # 15. COST EFFICIENCY BREAKDOWN
     # ══════════════════════════════════════════════════════════════
     st.subheader("Cost Efficiency")
     eff_cols = st.columns(4)
