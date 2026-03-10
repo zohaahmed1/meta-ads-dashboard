@@ -190,6 +190,60 @@ def render_sidebar():
         else:
             st.sidebar.caption("Install `streamlit-autorefresh` for true auto-refresh")
 
+    # ── Client Context (collapsible) ──
+    with st.sidebar.expander("Client Context", expanded=False):
+        st.caption("Add client info to get tailored recommendations")
+
+        client_name = st.text_input(
+            "Client / Brand Name",
+            key=f"ctx_name_{active_account_id}",
+            placeholder="e.g. Art of Living Canada",
+        )
+        client_industry = st.selectbox(
+            "Industry",
+            ["", "E-commerce", "SaaS", "Lead Gen", "App Install",
+             "Local Business", "Education", "Health & Wellness",
+             "Finance", "Real Estate", "Non-Profit", "Other"],
+            key=f"ctx_industry_{active_account_id}",
+        )
+        client_goal = st.selectbox(
+            "Primary Goal",
+            ["", "Maximize ROAS", "Minimize CPA", "Scale Volume",
+             "Brand Awareness", "Lead Generation", "App Installs"],
+            key=f"ctx_goal_{active_account_id}",
+        )
+        target_cpa = st.number_input(
+            "Target CPA ($)", min_value=0.0, step=5.0, value=0.0,
+            key=f"ctx_cpa_{active_account_id}",
+            help="Set to 0 to skip CPA-based recommendations",
+        )
+        target_roas = st.number_input(
+            "Target ROAS (x)", min_value=0.0, step=0.5, value=0.0,
+            key=f"ctx_roas_{active_account_id}",
+            help="Set to 0 to skip ROAS-based recommendations",
+        )
+        monthly_budget = st.number_input(
+            "Monthly Budget ($)", min_value=0.0, step=500.0, value=0.0,
+            key=f"ctx_budget_{active_account_id}",
+            help="Set to 0 to skip budget pacing recommendations",
+        )
+        client_notes = st.text_area(
+            "Notes / Context",
+            key=f"ctx_notes_{active_account_id}",
+            placeholder="e.g. Running meditation retreat promos. Peak season is Jan-Mar. Audience is 35-55 females in Canada.",
+            height=100,
+        )
+
+    client_context = {
+        "name": client_name,
+        "industry": client_industry,
+        "goal": client_goal,
+        "target_cpa": target_cpa if target_cpa > 0 else None,
+        "target_roas": target_roas if target_roas > 0 else None,
+        "monthly_budget": monthly_budget if monthly_budget > 0 else None,
+        "notes": client_notes,
+    }
+
     # ── Slack webhook (collapsible) ──
     with st.sidebar.expander("Slack Integration"):
         slack_webhook = st.text_input(
@@ -213,6 +267,7 @@ def render_sidebar():
         "auto_refresh": auto_refresh,
         "refresh_mins": refresh_mins,
         "slack_webhook": slack_webhook,
+        "client_context": client_context,
     }
 
 
@@ -602,6 +657,33 @@ def render_analysis(df, summary, comparison, config):
         return
 
     camp_df = campaign_comparison(df)
+    ctx = config.get("client_context", {})
+
+    # ══════════════════════════════════════════════════════════════
+    # 0. CLIENT CONTEXT BANNER
+    # ══════════════════════════════════════════════════════════════
+    has_context = any([ctx.get("name"), ctx.get("goal"), ctx.get("target_cpa"),
+                       ctx.get("target_roas"), ctx.get("monthly_budget")])
+    if has_context:
+        parts = []
+        if ctx.get("name"):
+            parts.append(f"**{ctx['name']}**")
+        if ctx.get("industry"):
+            parts.append(ctx["industry"])
+        if ctx.get("goal"):
+            parts.append(f"Goal: {ctx['goal']}")
+        targets = []
+        if ctx.get("target_cpa"):
+            targets.append(f"Target CPA: ${ctx['target_cpa']:,.2f}")
+        if ctx.get("target_roas"):
+            targets.append(f"Target ROAS: {ctx['target_roas']:.1f}x")
+        if ctx.get("monthly_budget"):
+            targets.append(f"Monthly Budget: ${ctx['monthly_budget']:,.0f}")
+        if targets:
+            parts.append(" | ".join(targets))
+        st.info(" — ".join(parts))
+    else:
+        st.caption("Tip: Add client context in the sidebar to get tailored recommendations with target-based alerts.")
 
     # ══════════════════════════════════════════════════════════════
     # 1. HEALTH SCORE + SPEND ALLOCATION SCORE
@@ -610,10 +692,23 @@ def render_analysis(df, summary, comparison, config):
 
     with score_col1:
         # Account health score: composite of ROAS, CTR, frequency
-        roas_score = min(summary.get("roas", 0) / 3.0 * 100, 100)  # 3x ROAS = 100
+        # If client targets are set, score against those instead of generic benchmarks
+        roas_benchmark = ctx.get("target_roas") or 3.0
+        roas_score = min(summary.get("roas", 0) / roas_benchmark * 100, 100)
+
         ctr_score = min(summary.get("avg_ctr", 0) / 2.0 * 100, 100)  # 2% CTR = 100
-        freq_penalty = max(0, (summary.get("avg_frequency", 0) - 3.0) * 20)  # Penalize high freq
-        health = max(0, min(100, (roas_score * 0.5 + ctr_score * 0.3 + 20) - freq_penalty))
+        freq_penalty = max(0, (summary.get("avg_frequency", 0) - 3.0) * 20)
+
+        # CPA score if target set
+        cpa_score = 0
+        if ctx.get("target_cpa") and summary.get("cost_per_conversion", 0) > 0:
+            cpa_ratio = ctx["target_cpa"] / summary["cost_per_conversion"]
+            cpa_score = min(cpa_ratio * 100, 100)
+            health = max(0, min(100, (roas_score * 0.35 + ctr_score * 0.2 + cpa_score * 0.25 + 20) - freq_penalty))
+            score_basis = "ROAS vs target (35%), CPA vs target (25%), CTR (20%), frequency (20%)"
+        else:
+            health = max(0, min(100, (roas_score * 0.5 + ctr_score * 0.3 + 20) - freq_penalty))
+            score_basis = "ROAS (50%), CTR (30%), and frequency penalty (20%)"
 
         health_color = "#2ca02c" if health >= 70 else "#ff7f0e" if health >= 40 else "#d62728"
         st.markdown(f"### Account Health Score")
@@ -623,7 +718,7 @@ def render_analysis(df, summary, comparison, config):
             f"<span style='font-size:24px;color:gray'>/100</span></div>",
             unsafe_allow_html=True,
         )
-        st.caption("Based on ROAS (50%), CTR (30%), and frequency penalty (20%)")
+        st.caption(f"Based on {score_basis}")
 
     with score_col2:
         alloc = spend_allocation_score(camp_df)
@@ -647,7 +742,7 @@ def render_analysis(df, summary, comparison, config):
     # 2. OPTIMIZATION RECOMMENDATIONS
     # ══════════════════════════════════════════════════════════════
     st.subheader("Optimization Recommendations")
-    recs = generate_recommendations(camp_df, summary)
+    recs = generate_recommendations(camp_df, summary, client_context=ctx)
 
     # Add creative fatigue warnings
     fatigue = creative_fatigue_check(df)

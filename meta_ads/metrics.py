@@ -374,17 +374,26 @@ def budget_pacing(campaigns, insights_df):
     return pd.DataFrame(rows).sort_values("actual_spend", ascending=False)
 
 
-def generate_recommendations(camp_df, summary):
+def generate_recommendations(camp_df, summary, client_context=None):
     """Generate actionable optimization recommendations from campaign data.
 
     Args:
         camp_df: DataFrame from campaign_comparison()
         summary: dict from summary_metrics()
+        client_context: optional dict with keys: name, industry, goal,
+                        target_cpa, target_roas, monthly_budget, notes
 
     Returns: list of (icon, message) tuples sorted by severity
     """
     if camp_df.empty:
         return []
+
+    ctx = client_context or {}
+    target_cpa = ctx.get("target_cpa")
+    target_roas = ctx.get("target_roas")
+    monthly_budget = ctx.get("monthly_budget")
+    goal = ctx.get("goal", "")
+    client_name = ctx.get("name", "")
 
     recs = []
     avg_roas = summary.get("roas", 0)
@@ -393,6 +402,30 @@ def generate_recommendations(camp_df, summary):
     avg_cost_per_conv = summary.get("cost_per_conversion", 0)
     total_spend = summary.get("total_spend", 1)
 
+    # ── Client target-based recommendations ──
+    if target_roas and avg_roas > 0:
+        if avg_roas < target_roas:
+            gap_pct = ((target_roas - avg_roas) / target_roas) * 100
+            recs.append((1, "🎯", f"Account ROAS ({avg_roas:.2f}x) is **{gap_pct:.0f}% below target** ({target_roas:.1f}x). Priority: cut low-ROAS campaigns, scale winners."))
+        else:
+            recs.append((4, "✅", f"Account ROAS ({avg_roas:.2f}x) is **above target** ({target_roas:.1f}x). Consider scaling spend to capture more volume."))
+
+    if target_cpa and avg_cost_per_conv > 0:
+        if avg_cost_per_conv > target_cpa:
+            over_pct = ((avg_cost_per_conv - target_cpa) / target_cpa) * 100
+            recs.append((1, "🎯", f"Avg CPA (${avg_cost_per_conv:,.2f}) is **{over_pct:.0f}% over target** (${target_cpa:,.2f}). Tighten audiences or pause expensive campaigns."))
+        else:
+            recs.append((4, "✅", f"Avg CPA (${avg_cost_per_conv:,.2f}) is **under target** (${target_cpa:,.2f}). Room to scale volume."))
+
+    if monthly_budget and total_spend > 0:
+        # Estimate monthly run rate from current spend period
+        pacing_pct = (total_spend / monthly_budget) * 100
+        if pacing_pct > 110:
+            recs.append((1, "🔴", f"On track to **overspend** monthly budget (${monthly_budget:,.0f}). Current period spend is ${total_spend:,.0f} ({pacing_pct:.0f}% of monthly)."))
+        elif pacing_pct < 60:
+            recs.append((2, "🟡", f"**Underspending** vs monthly budget (${monthly_budget:,.0f}). Only ${total_spend:,.0f} spent ({pacing_pct:.0f}%). Increase budgets on top performers."))
+
+    # ── Per-campaign recommendations ──
     for _, row in camp_df.iterrows():
         name = row["campaign_name"]
         roas = row.get("roas", 0)
@@ -402,34 +435,49 @@ def generate_recommendations(camp_df, summary):
         convs = row.get("total_conversions", 0)
         spend_share = (spend / total_spend * 100) if total_spend > 0 else 0
 
-        # High spend + low ROAS → pause/reduce
-        if roas < 1.0 and spend_share > 10:
-            recs.append((1, "🔴", f"**{name}** — ROAS {roas:.2f}x on {spend_share:.0f}% of total spend. Consider pausing or cutting budget."))
+        # Target CPA checks per campaign
+        if target_cpa and cost_per > 0 and cost_per > target_cpa * 1.5:
+            recs.append((1, "🔴", f"**{name}** — CPA ${cost_per:,.2f} is **{((cost_per/target_cpa)-1)*100:.0f}% over target** (${target_cpa:,.2f}). Cut budget or restructure."))
+        elif target_cpa and cost_per > 0 and cost_per < target_cpa * 0.7:
+            recs.append((3, "🟢", f"**{name}** — CPA ${cost_per:,.2f} is **well under target**. Scale this campaign."))
 
-        # High ROAS + low spend share → scale
-        elif roas > avg_roas * 1.5 and roas > 1.5 and spend_share < 40:
-            recs.append((3, "🟢", f"**{name}** — {roas:.2f}x ROAS, only {spend_share:.0f}% of budget. Strong candidate to scale."))
+        # Target ROAS checks per campaign
+        if target_roas and roas > 0 and roas < target_roas * 0.5 and spend_share > 10:
+            recs.append((1, "🔴", f"**{name}** — ROAS {roas:.2f}x is **less than half of target** ({target_roas:.1f}x) while consuming {spend_share:.0f}% of budget. Pause or restructure."))
+
+        # Generic checks (only if no client targets set)
+        if not target_roas and not target_cpa:
+            if roas < 1.0 and spend_share > 10:
+                recs.append((1, "🔴", f"**{name}** — ROAS {roas:.2f}x on {spend_share:.0f}% of total spend. Consider pausing or cutting budget."))
+            elif roas > avg_roas * 1.5 and roas > 1.5 and spend_share < 40:
+                recs.append((3, "🟢", f"**{name}** — {roas:.2f}x ROAS, only {spend_share:.0f}% of budget. Strong candidate to scale."))
 
         # Low CTR → creative/targeting issue
         if ctr < avg_ctr * 0.5 and spend > 0:
             recs.append((2, "🟡", f"**{name}** — CTR {ctr:.2f}% is well below average ({avg_ctr:.2f}%). Test new creatives or tighten targeting."))
 
-        # Expensive conversions
-        if avg_cost_per_conv > 0 and cost_per > avg_cost_per_conv * 2 and convs > 0:
+        # Expensive conversions (generic, only without target CPA)
+        if not target_cpa and avg_cost_per_conv > 0 and cost_per > avg_cost_per_conv * 2 and convs > 0:
             recs.append((2, "🟡", f"**{name}** — Cost/conversion ${cost_per:,.2f} is 2x+ above account average. Review audiences."))
 
         # Zero conversions with meaningful spend
         if convs == 0 and spend > total_spend * 0.05:
             recs.append((1, "🔴", f"**{name}** — ${spend:,.0f} spent with zero conversions. Pause or restructure."))
 
-    # Account-level insights
-    if avg_roas > 0 and avg_roas < 1.0:
+    # ── Account-level insights ──
+    if not target_roas and avg_roas > 0 and avg_roas < 1.0:
         recs.append((1, "🔴", f"Account-wide ROAS is {avg_roas:.2f}x — spending more than you're earning. Review all campaigns."))
 
     if avg_ctr < 1.0:
         recs.append((2, "🟡", f"Account CTR is {avg_ctr:.2f}% — below 1% benchmark. Test new ad formats or creative angles."))
 
-    # Sort by priority (1=critical, 2=warning, 3=opportunity)
+    # ── Goal-specific recommendations ──
+    if goal == "Scale Volume" and avg_roas > 1.5:
+        recs.append((3, "🟢", f"ROAS is healthy ({avg_roas:.2f}x) — you have headroom to increase budgets 20-30% while maintaining profitability."))
+    elif goal == "Brand Awareness":
+        recs.append((3, "💡", f"For awareness, focus on CPM (${summary.get('avg_cpm', 0):,.2f}) and reach ({summary.get('total_reach', 0):,}) rather than conversions."))
+
+    # Sort by priority (1=critical, 2=warning, 3=opportunity, 4=positive)
     recs.sort(key=lambda x: x[0])
     return [(icon, msg) for _, icon, msg in recs]
 
